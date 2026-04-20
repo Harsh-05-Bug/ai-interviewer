@@ -1,0 +1,70 @@
+module.exports = {
+  content: ["./src/**/*.{js,jsx}", "./public/index.html"],
+  darkMode: 'class',
+  theme: {
+    extend: {
+      fontFamily: {
+        display: ["'SF Pro Display'", "'Inter'", "system-ui", "sans-serif"],
+        body: ["'Inter'", "'SF Pro Text'", "system-ui", "sans-serif"],
+        mono: ["'SF Mono'", "'JetBrains Mono'", "monospace"],
+      },
+      colors: {
+        // Apple-inspired semantic colors — controlled by CSS variables
+        primary: 'var(--color-bg-primary)',
+        secondary: 'var(--color-bg-secondary)',
+        tertiary: 'var(--color-bg-tertiary)',
+        elevated: 'var(--color-bg-elevated)',
+        accent: {
+          DEFAULT: 'var(--color-accent)',
+          hover: 'var(--color-accent-hover)',
+          light: 'var(--color-accent-light)',
+        },
+        surface: {
+          DEFAULT: 'var(--color-surface)',
+          hover: 'var(--color-surface-hover)',
+          border: 'var(--color-border)',
+        },
+        // Keep old colors for backward compatibility during migration
+        ink: { 900: "#0A0A0F", 800: "#13131A", 700: "#1C1C27", 600: "#2A2A3D", 500: "#3D3D5C" },
+        gold: { 400: "#F5C842", 300: "#F7D56E", 200: "#FAE49A" },
+        jade: { 500: "#00C896", 400: "#00DFA8" },
+        crimson: { 500: "#FF3A5C", 400: "#FF6B84" },
+        slate: { dim: "#8888AA", muted: "#5C5C7A" },
+      },
+      keyframes: {
+        fadeUp: { from: { opacity: 0, transform: "translateY(20px)" }, to: { opacity: 1, transform: "translateY(0)" } },
+        fadeIn: { from: { opacity: 0 }, to: { opacity: 1 } },
+        scaleIn: { from: { opacity: 0, transform: "scale(0.95)" }, to: { opacity: 1, transform: "scale(1)" } },
+        slideUp: { from: { opacity: 0, transform: "translateY(40px)" }, to: { opacity: 1, transform: "translateY(0)" } },
+        shimmer: { "0%": { backgroundPosition: "0% center" }, "100%": { backgroundPosition: "200% center" } },
+        float: { "0%, 100%": { transform: "translateY(0)" }, "50%": { transform: "translateY(-10px)" } },
+        glow: { "0%, 100%": { opacity: 0.4 }, "50%": { opacity: 1 } },
+        orbit: { "0%": { transform: "rotate(0deg) translateX(120px) rotate(0deg)" }, "100%": { transform: "rotate(360deg) translateX(120px) rotate(-360deg)" } },
+        typingBounce: { "0%,80%,100%": { transform: "translateY(0)", opacity: 0.4 }, "40%": { transform: "translateY(-6px)", opacity: 1 } },
+        chatEnter: { from: { opacity: 0, transform: "translateY(12px) scale(0.97)" }, to: { opacity: 1, transform: "translateY(0) scale(1)" } },
+        gridMove: { "0%": { transform: "translateY(0)" }, "100%": { transform: "translateY(60px)" } },
+        blobMove: { "0%, 100%": { borderRadius: "60% 40% 30% 70% / 60% 30% 70% 40%" }, "50%": { borderRadius: "30% 60% 70% 40% / 50% 60% 30% 60%" } },
+      },
+      animation: {
+        "fade-up": "fadeUp 0.6s ease forwards",
+        "fade-in": "fadeIn 0.5s ease forwards",
+        "scale-in": "scaleIn 0.5s ease forwards",
+        "slide-up": "slideUp 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards",
+        shimmer: "shimmer 3s linear infinite",
+        float: "float 6s ease-in-out infinite",
+        glow: "glow 3s ease-in-out infinite",
+        orbit: "orbit 20s linear infinite",
+        typing: "typingBounce 1.4s ease-in-out infinite",
+        chatEnter: "chatEnter 0.35s cubic-bezier(0.34, 1.56, 0.64, 1) forwards",
+        "grid-move": "gridMove 4s linear infinite",
+        "blob": "blobMove 8s ease-in-out infinite",
+      },
+      backdropBlur: {
+        xs: '2px',
+        '2xl': '40px',
+        '3xl': '64px',
+      },
+    },
+  },
+  plugins: [],
+};
