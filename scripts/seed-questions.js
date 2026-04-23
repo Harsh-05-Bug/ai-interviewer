@@ -1,7 +1,7 @@
 require('dotenv').config();
 const mongoose = require('mongoose');
 const Question = require('../models/Question');
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/ai_interviewer';
+const MONGO_URI = process.env.MONGODB_URI || process.env.MONGO_URI || 'mongodb://localhost:27017/ai_interviewer';
 
 // Compact: [title, desc, difficulty, hint, answer, leetcode, companies]
 const data = {
@@ -632,48 +632,47 @@ for (const [topic, {type, tags, qs}] of Object.entries(data)) {
   }
 }
 
-async function seed() {
-  try {
-    await mongoose.connect(MONGO_URI);
-    console.log('Connected to MongoDB');
-    const existing = await Question.countDocuments();
-    console.log('Existing:', existing);
-    if (existing>0 && !process.argv.includes('--force') && !process.argv.includes('--append')) {
-      console.log('Use --force (clear+seed) or --append (add new)');
-      process.exit(0);
+// Exported function — callable from /run-seed route (reuses existing mongoose connection)
+async function seedQuestions() {
+  let ins=0, skip=0, err=0;
+  const errors=[];
+  for (const q of questions) {
+    try {
+      const ex = await Question.findOne({title:q.title,topic:q.topic});
+      if (ex) { skip++; continue; }
+      await Question.create(q);
+      ins++;
+    } catch(e) {
+      if (e.code===11000) skip++;
+      else { err++; if(errors.length<5) errors.push(`${q.title}: ${e.message}`); }
     }
-    if (process.argv.includes('--force')) {
-      await Question.deleteMany({});
-      console.log('Cleared all questions');
-    }
-    let ins=0, skip=0, err=0;
-    for (const q of questions) {
-      try {
-        const ex = await Question.findOne({title:q.title,topic:q.topic});
-        if (ex) { skip++; continue; }
-        await Question.create(q);
-        ins++;
-      } catch(e) {
-        if (e.code===11000) skip++;
-        else { err++; if(err<=10) console.error(`Err "${q.title}":`,e.message); }
-      }
-    }
-    console.log(`\nInserted:${ins} Skipped:${skip} Errors:${err}`);
-    const byTopic = {};
-    questions.forEach(q => {
-      if(!byTopic[q.topic]) byTopic[q.topic]={E:0,M:0,H:0,t:0};
-      if(q.difficulty==='Easy') byTopic[q.topic].E++;
-      if(q.difficulty==='Medium') byTopic[q.topic].M++;
-      if(q.difficulty==='Hard') byTopic[q.topic].H++;
-      byTopic[q.topic].t++;
-    });
-    console.log('\nBy Topic:');
-    Object.entries(byTopic).sort((a,b)=>b[1].t-a[1].t).forEach(([t,c])=>{
-      console.log(`  ${t.padEnd(25)} ${String(c.E).padStart(2)}E ${String(c.M).padStart(2)}M ${String(c.H).padStart(2)}H = ${c.t}`);
-    });
-    const tot = await Question.countDocuments();
-    console.log(`\nSeed: ${questions.length} | DB: ${tot}`);
-  } catch(e) { console.error(e); }
-  finally { await mongoose.disconnect(); console.log('Done'); }
+  }
+  const total = await Question.countDocuments();
+  return { totalInFile: questions.length, inserted: ins, skipped: skip, errors: err, totalInDB: total, sampleErrors: errors };
 }
-seed();
+
+module.exports = seedQuestions;
+
+// CLI mode — only runs when you do `node scripts/seed-questions.js` directly
+if (require.main === module) {
+  (async () => {
+    try {
+      await mongoose.connect(MONGO_URI);
+      console.log('Connected to MongoDB');
+      const existing = await Question.countDocuments();
+      console.log('Existing:', existing);
+      if (existing>0 && !process.argv.includes('--force') && !process.argv.includes('--append')) {
+        console.log('Use --force (clear+seed) or --append (add new)');
+        process.exit(0);
+      }
+      if (process.argv.includes('--force')) {
+        await Question.deleteMany({});
+        console.log('Cleared all questions');
+      }
+      const result = await seedQuestions();
+      console.log(`\nInserted:${result.inserted} Skipped:${result.skipped} Errors:${result.errors}`);
+      console.log(`Seed: ${result.totalInFile} | DB: ${result.totalInDB}`);
+    } catch(e) { console.error(e); }
+    finally { await mongoose.disconnect(); console.log('Done'); }
+  })();
+}
