@@ -42,7 +42,7 @@ const UserSchema = new mongoose.Schema({
   profileCompleted: { type: Boolean, default: false },
 
   // Public profile
-  username: { type: String, default: null, unique: true, sparse: true },
+  username: { type: String, default: null },
   displayName: { type: String, default: '' },
   useRealName: { type: Boolean, default: true },
   isPublicProfile: { type: Boolean, default: false },
@@ -61,7 +61,7 @@ const UserSchema = new mongoose.Schema({
   },
 
   // Referrals
-  referralCode: { type: String, unique: true, sparse: true },
+  referralCode: { type: String, default: null },
   referredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   referrals: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   referralRewards: { type: Number, default: 0 },
