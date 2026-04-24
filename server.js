@@ -50,16 +50,7 @@ app.use('/api/forum', featureCheck('forum'), require('./routes/forum'));
 app.use('/api/study-groups', featureCheck('studyrooms'), require('./routes/studyGroups'));
 app.use('/api/admin-panel', require('./routes/adminPanel'));
 
-// Temporary seed route
-app.get('/run-seed', async (req, res) => {
-  try {
-    const seedQuestions = require('./scripts/seed-questions');
-    const result = await seedQuestions();
-    res.json({ success: true, ...result });
-  } catch (err) {
-    res.json({ success: false, error: err.message });
-  }
-});
+
 
 // Health check
 app.get('/health', (req, res) => {
