@@ -1,5 +1,4 @@
 const mongoose = require('mongoose');
-
 const QuestionSchema = new mongoose.Schema({
   title: { type: String, required: true, trim: true },
   description: { type: String, default: '' },
@@ -28,10 +27,9 @@ const QuestionSchema = new mongoose.Schema({
   leetcodeLink: { type: String, default: '' },
   solution: { type: String, default: '' },
   answer: { type: String, default: '' },
+  detailedAnswer: { type: String, default: '' },
   customTopic: { type: String, default: '' },
   createdAt: { type: Date, default: Date.now },
 });
-
 QuestionSchema.index({ title: 1, topic: 1 }, { unique: true });
-
 module.exports = mongoose.model('Question', QuestionSchema);
