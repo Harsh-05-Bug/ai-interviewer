@@ -1,8 +1,7 @@
 // scripts/seed-detailed-answers.js
 //
 // Upserts the `detailedAnswer` field on existing Question docs.
-// Matches by { topic, title } — adjust the match field below if your
-// Question schema uses a different field (e.g. `question` instead of `title`).
+// Matches by { topic, title } with apostrophe-tolerant fallback.
 //
 // Usage:
 //   - As a CLI:        node scripts/seed-detailed-answers.js
@@ -13,8 +12,17 @@ const mongoose = require('mongoose');
 const Question = require('../models/Question');
 const detailedAnswers = require('./detailed-answers-data');
 
-// CHANGE THIS if your Question schema's title field is named differently.
 const TITLE_FIELD = 'title';
+
+// Normalize: lowercase + replace curly quotes with straight + collapse whitespace
+function norm(s) {
+  return String(s)
+    .replace(/\u2019/g, "'")
+    .replace(/\u2018/g, "'")
+    .replace(/\u201c|\u201d/g, '"')
+    .toLowerCase()
+    .trim();
+}
 
 async function seedDetailedAnswers() {
   let updated = 0;
@@ -22,21 +30,41 @@ async function seedDetailedAnswers() {
   let unchanged = 0;
   const missing = [];
 
+  // Pre-load all titles per topic for fallback fuzzy matching
+  const allDocs = await Question.find({}, { topic: 1, [TITLE_FIELD]: 1 }).lean();
+  const byTopicNorm = {};
+  for (const doc of allDocs) {
+    if (!byTopicNorm[doc.topic]) byTopicNorm[doc.topic] = new Map();
+    byTopicNorm[doc.topic].set(norm(doc[TITLE_FIELD]), doc[TITLE_FIELD]);
+  }
+
   for (const topic of Object.keys(detailedAnswers)) {
     for (const title of Object.keys(detailedAnswers[topic])) {
       const detailedAnswer = detailedAnswers[topic][title];
 
-      const filter = { topic, [TITLE_FIELD]: title };
-      const result = await Question.updateOne(
-        filter,
+      // 1) Try exact match
+      let result = await Question.updateOne(
+        { topic, [TITLE_FIELD]: title },
         { $set: { detailedAnswer } }
       );
+
+      // 2) Fallback: case/apostrophe-insensitive lookup
+      if (result.matchedCount === 0) {
+        const normalized = norm(title);
+        const actualTitle = byTopicNorm[topic]?.get(normalized);
+        if (actualTitle) {
+          result = await Question.updateOne(
+            { topic, [TITLE_FIELD]: actualTitle },
+            { $set: { detailedAnswer } }
+          );
+        }
+      }
 
       if (result.matchedCount === 0) {
         notFound++;
         missing.push(`${topic} / ${title}`);
       } else if (result.modifiedCount === 0) {
-        unchanged++; // matched but value already identical
+        unchanged++;
       } else {
         updated++;
       }
@@ -55,7 +83,6 @@ async function seedDetailedAnswers() {
   };
 }
 
-// CLI mode
 if (require.main === module) {
   const MONGO_URI = process.env.MONGODB_URI || process.env.MONGO_URI;
   if (!MONGO_URI) {
@@ -65,27 +92,9 @@ if (require.main === module) {
 
   (async () => {
     try {
-      console.log('Connecting to MongoDB...');
       await mongoose.connect(MONGO_URI);
-      console.log('Connected. Seeding detailed answers...');
-
       const result = await seedDetailedAnswers();
-
-      console.log('\n=== Seed Complete ===');
-      console.log('Total entries in data file:', result.totalEntries);
-      console.log('Updated (value changed):  ', result.updated);
-      console.log('Unchanged (already same): ', result.unchanged);
-      console.log('Not found in DB:          ', result.notFound);
-
-      if (result.missing.length > 0) {
-        console.log('\nUnmatched entries (no Question doc found):');
-        result.missing.forEach(m => console.log('  -', m));
-        console.log(
-          '\nFix: ensure the question titles in MongoDB match the keys in detailed-answers-data.js,'
-        );
-        console.log('or change TITLE_FIELD in this script if your schema uses a different field name.');
-      }
-
+      console.log(JSON.stringify(result, null, 2));
       await mongoose.disconnect();
       process.exit(0);
     } catch (err) {

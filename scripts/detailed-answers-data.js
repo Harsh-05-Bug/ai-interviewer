@@ -4030,7 +4030,7 @@ Interrupts are how computers handle the asynchronous real world — keystrokes, 
 2. What's interrupt latency? (Time from interrupt to ISR execution — critical for RT systems)
 3. Why are interrupts often disabled in ISRs? (Prevent reentrance; keep ISR atomic)`,
 
-    'DMA': `## Definition
+    'What is DMA': `## Definition
 **Direct Memory Access (DMA)** is a hardware feature that allows peripherals (disk controllers, network cards, GPUs) to transfer data directly to/from memory without involving the CPU for each byte. The CPU sets up the transfer, then the DMA controller handles the actual data movement, freeing the CPU for other work.
 
 ## Why It Matters
@@ -4283,7 +4283,7 @@ Without COW, fork would copy entire shell memory just to throw it away in exec �
 2. Why mark pages read-only? (So write attempts trigger faults the kernel can intercept)
 3. What's the alternative to COW? (Eager copying — duplicate everything immediately, much slower)`,
 
-    'Preemptive vs Non-Preemptive': `## Definition
+    'Preemptive vs Non': `## Definition
 **Preemptive scheduling** allows the OS to forcibly take the CPU away from a running process to give it to another (typically when a higher-priority process arrives or a time quantum expires). **Non-preemptive scheduling** lets a running process keep the CPU until it voluntarily yields (blocks on I/O, completes, or explicitly gives up).
 
 ## Why It Matters
@@ -4727,7 +4727,7 @@ Save as \`/etc/systemd/system/myapp.service\`. Run \`systemctl enable myapp\` to
 2. Why setsid? (Creates new session, detaches from terminal)
 3. What's a Java daemon thread? (Thread that doesn't prevent JVM exit — for background tasks)`,
 
-    'fork()': `## Definition
+    'fork() Call': `## Definition
 **fork()** is a Unix system call that creates a new process by duplicating the calling process. The new process (child) is an almost-exact copy of the original (parent). After fork, both processes execute the next instruction independently. fork() returns differently in each — 0 in child, child's PID in parent, -1 on failure.
 
 ## Why It Matters
@@ -4838,7 +4838,7 @@ Recursive forking exhausts process slots. Why \`ulimit\` exists.
 2. What is COW in fork? (Memory pages shared until written, then copied — fast fork)
 3. Why is fork+exec common? (Most child processes are immediately replaced with a new program — fork creates the slot, exec replaces it)`,
 
-    'exec()': `## Definition
+    'exec() Family': `## Definition
 **exec()** is a family of Unix system calls that REPLACES the current process's memory image with a new program. After exec, the original program is gone — the new program runs in its place, with the same PID. Unlike fork(), exec() doesn't create a new process; it transforms the current one.
 
 ## Why It Matters
@@ -4950,7 +4950,7 @@ If exec fails (file not found, permission denied), it returns. Otherwise, exec N
 2. Why does exec only return on failure? (Success means the calling code is gone — replaced)
 3. What's preserved across exec? (PID, fds (unless close-on-exec), working directory, etc.)`,
 
-    'Spinlock': `## Definition
+    'What is Spinlock': `## Definition
 A **spinlock** is a low-level synchronization primitive where a thread waiting for a lock continuously checks (spins) until the lock becomes available, instead of yielding to the OS scheduler. Useful for very short critical sections where the cost of context switching exceeds the cost of busy-waiting.
 
 ## Why It Matters
@@ -5392,7 +5392,7 @@ Atomic operation — CAS hardware instruction handles the critical section invis
 2. Why doesn't disabling interrupts work on multiprocessors? (Other CPUs continue running)
 3. What's the difference between mutex and critical section? (CS is the code area; mutex is one tool to protect it)`,
 
-    "Belady's Anomaly": `## Definition
+    "Belady\u2019s Anomaly": `## Definition
 **Belady's Anomaly** is the counterintuitive phenomenon where increasing the number of page frames available to a process can INCREASE the number of page faults under certain page replacement algorithms (specifically FIFO). Named after László Bélády who discovered it in 1969.
 
 ## Why It Matters
@@ -5900,7 +5900,7 @@ Embeds related data — fast reads, but customer info duplicated across orders.
 2. When would you denormalize? (Read-heavy, analytics, performance-critical)
 3. Difference between 3NF and BCNF? (BCNF stricter — every determinant must be a candidate key)`,
 
-    'SQL Joins': `## Definition
+    'SQL JOINs': `## Definition
 **SQL JOINs** combine rows from two or more tables based on related columns. Different join types produce different result sets depending on which rows match and which don't. Understanding joins is fundamental to working with relational databases.
 
 ## Why It Matters
@@ -6033,7 +6033,7 @@ Classic "find unmatched" pattern using LEFT JOIN + IS NULL.
 2. When use CROSS JOIN? (Generating combinations, rare in practice)
 3. What's a self-join used for? (Hierarchical data — employee/manager in same table)`,
 
-    'Indexes': `## Definition
+    'Database Indexing': `## Definition
 A **database index** is a data structure that improves the speed of data retrieval operations on a table at the cost of additional space and slower writes. Indexes work like a book's index — instead of scanning every row, the database uses the index to find data quickly.
 
 ## Why It Matters
@@ -6160,7 +6160,7 @@ Index on \`(author_id, date DESC)\` makes both filtering and sorting fast — no
 2. How does a B-tree index work? (Balanced tree, log N search)
 3. Can multiple indexes be used in one query? (Yes — index intersection in many DBs)`,
 
-    'B-Trees': `## Definition
+    'B-Tree vs B+': `## Definition
 A **B-Tree** is a self-balancing tree data structure that maintains sorted data and allows searches, insertions, and deletions in logarithmic time (O(log N)). It's the most common data structure for database indexes and filesystem metadata. The "B" stands for "balanced" (not "binary" — B-Trees can have many children per node).
 
 ## Why It Matters
@@ -6645,7 +6645,7 @@ products(id PK, name, price)
 2. Composite primary key vs surrogate key? (Surrogate is simpler; composite has business meaning)
 3. Why isn't FK auto-indexed? (Historical decision; always add manually for JOIN performance)`,
 
-    'NoSQL vs SQL': `## Definition
+    'SQL vs NoSQL': `## Definition
 **SQL databases** (relational) store structured data in tables with predefined schemas, support ACID transactions, and use SQL for queries. **NoSQL databases** are diverse — document stores, key-value stores, wide-column stores, graph databases — typically offering schema flexibility, horizontal scaling, and BASE consistency model instead of ACID.
 
 ## Why It Matters
@@ -7206,7 +7206,7 @@ More testable, version-controlled, language-agnostic.
 2. Why are stored procedures less popular now? (Hard to test/version-control; ORM/app-layer alternatives)
 3. When would you use a stored procedure? (Bulk data ops, security-critical logic, performance-critical)`,
 
-    'Database Triggers': `## Definition
+    'Triggers': `## Definition
 A **trigger** is a special kind of stored procedure that automatically executes (fires) in response to specific events on a table — INSERT, UPDATE, or DELETE. Triggers run in the same transaction as the triggering operation, providing a way to automatically enforce rules, log changes, or maintain derived data.
 
 ## Why It Matters
@@ -7359,7 +7359,7 @@ EXECUTE FUNCTION log_user_change();
 2. Why avoid heavy trigger use? (Hidden behavior, hard to debug, performance)
 3. Per-row vs per-statement? (Per-row: each affected row. Per-statement: once per query.)`,
 
-    'Views': `## Definition
+    'Views SQL': `## Definition
 A **view** is a virtual table defined by a SQL query. It looks like a table to users — they can SELECT from it — but it's not stored as data; the underlying query runs each time the view is accessed. Views provide abstraction, security, and query simplification.
 
 ## Why It Matters
@@ -7702,7 +7702,7 @@ ORDER BY total_spent DESC;
 2. GROUP BY vs PARTITION BY? (GROUP BY collapses; PARTITION BY keeps rows)
 3. Why must SELECT match GROUP BY? (Each output row represents a group; non-grouped columns are ambiguous)`,
 
-    'Database Optimization': `## Definition
+    'Query Optimization': `## Definition
 **Database optimization** is the process of tuning database design, queries, and configurations to improve performance — reducing query time, increasing throughput, and minimizing resource usage. It spans schema design, indexing, query writing, hardware, and configuration.
 
 ## Why It Matters
@@ -8703,7 +8703,7 @@ OLTP and OLAP have fundamentally different requirements that drive different dat
 2. Can one database do both? (HTAP systems try; usually trade-offs in either direction)
 3. What's a data lake? (Cheap, schema-flexible storage for raw data; queryable via separate engines)`,
 
-    'Database Locking': `## Definition
+    'Two-Phase Locking': `## Definition
 **Database locking** is the mechanism databases use to control concurrent access to data, ensuring transactions don't interfere destructively. Locks come in different types (shared, exclusive) and granularities (row, page, table) with different trade-offs between concurrency and overhead.
 
 ## Why It Matters
@@ -9156,7 +9156,7 @@ Application catches this and shows user-friendly error.
 2. CASCADE risks? (Can cascade delete unintended data — verify carefully)
 3. Difference between PRIMARY KEY and UNIQUE? (Primary: one per table, NOT NULL. Unique: many per table, may allow NULL.)`,
 
-    'Distributed Transactions': `## Definition
+    'Two-Phase Commit': `## Definition
 **Distributed transactions** span multiple databases or services. They require coordination protocols (like Two-Phase Commit) to ensure all participants either commit together or roll back together — preserving atomicity across systems. Modern microservices often replace them with Saga patterns due to their complexity and performance cost.
 
 ## Why It Matters
@@ -10098,7 +10098,7 @@ BASE (eventually consistent systems):
 2. How long until "eventually"? (Usually milliseconds; sometimes seconds; rarely minutes)
 3. What's read-your-writes consistency? (Subset of eventual: a user always sees their own updates)`,
 
-    'Database Connection Pooling': `## Definition
+    'Connection Pooling': `## Definition
 **Connection pooling** is a technique that maintains a cache of pre-established database connections, reusing them across application requests rather than creating new connections each time. It dramatically reduces connection overhead and limits resource usage.
 
 ## Why It Matters
@@ -10592,7 +10592,7 @@ Use cases: when no natural range/list partition fits; load balancing.
 2. What's partition pruning? (Query optimizer skips partitions not matching WHERE)
 3. Can you change partition key? (Hard — usually requires data migration. Plan carefully.)`,
 
-    'Materialized Views': `## Definition
+    'Materialized View': `## Definition
 A **materialized view** is a database object that stores the results of a query as a physical table, unlike regular views which compute the query each time. Materialized views provide fast access to expensive query results at the cost of storage and the need for refreshing when underlying data changes.
 
 ## Why It Matters
@@ -11448,7 +11448,7 @@ UDP-based protocols often add reliability where needed:
 2. Can you make UDP reliable? (Yes — QUIC, custom protocols add reliability at app layer)
 3. What's TCP head-of-line blocking? (One lost packet blocks all behind it on same connection)`,
 
-    'HTTP vs HTTPS': `## Definition
+    'How HTTPS Works': `## Definition
 **HTTP (HyperText Transfer Protocol)** is the foundational protocol of the web — it transmits hypertext requests and responses between clients and servers in plaintext. **HTTPS (HTTP Secure)** is HTTP encrypted via TLS (Transport Layer Security), providing confidentiality, integrity, and authentication.
 
 ## Why It Matters
@@ -11730,7 +11730,7 @@ Modern systems use CIDR (Classless Inter-Domain Routing):
 2. What's CIDR? (Classless routing — flexible network sizing via prefix length)
 3. Why is IPv6 adoption slow? (Huge install base, NAT works, transition complex)`,
 
-    'DNS': `## Definition
+    'DNS Resolution': `## Definition
 **DNS (Domain Name System)** is the internet's phonebook — it translates human-readable domain names (like google.com) into IP addresses (like 142.251.46.142). DNS is a distributed, hierarchical system that runs on UDP/TCP port 53.
 
 ## Why It Matters
@@ -12430,7 +12430,7 @@ Rarely seen by application code.
 2. 301 vs 302? (Permanent vs temporary redirect)
 3. 502 vs 503 vs 504? (502: bad upstream response. 503: server overloaded. 504: upstream timeout.)`,
 
-    'REST API': `## Definition
+    'REST vs GraphQL': `## Definition
 **REST (Representational State Transfer)** is an architectural style for designing networked applications. RESTful APIs use HTTP methods (GET, POST, PUT, DELETE) on resources identified by URLs, exchanging representations (often JSON). REST is stateless and follows several constraints designed to make APIs scalable and uniform.
 
 ## Why It Matters
@@ -12649,7 +12649,7 @@ GET /api/v1/users/123/orders
 2. PUT vs POST for create? (PUT: client knows URL. POST: server assigns.)
 3. REST vs GraphQL? (Multiple endpoints with fixed shape vs one endpoint with flexible queries)`,
 
-    'Cookies vs Sessions': `## Definition
+    'Cookies Sessions JWT': `## Definition
 **Cookies** are small pieces of data stored on the client (browser), sent with every request to a particular site. **Sessions** are server-side state about a user, typically referenced by a session ID stored in a cookie. Cookies are the storage mechanism; sessions are a usage pattern that often relies on cookies.
 
 ## Why It Matters
@@ -12836,7 +12836,7 @@ Worse for: auth (XSS risk).
 2. JWT vs sessions? (JWT: stateless, signed. Sessions: server-side, easy to revoke.)
 3. Why HttpOnly? (Prevents JavaScript access, mitigates XSS impact)`,
 
-    'JWT': `## Definition
+    'What is JWT': `## Definition
 **JWT (JSON Web Token, pronounced "jot")** is a compact, URL-safe token format for transmitting claims between parties as a JSON object. It's digitally signed (and optionally encrypted) so the receiver can verify integrity. Commonly used for authentication and information exchange in web APIs.
 
 ## Why It Matters
@@ -13068,7 +13068,7 @@ req.user = payload;
 2. How to revoke a JWT? (Short expiry, blacklist, refresh token rotation)
 3. Why "alg: none" is bad? (No signature — anyone can forge tokens)`,
 
-    'OAuth': `## Definition
+    'OAuth 2.0': `## Definition
 **OAuth 2.0** is an authorization framework that allows third-party applications to access resources on behalf of a user without sharing the user's credentials. Instead, the user grants limited access via tokens. It's the standard for "Login with Google/Facebook/GitHub" and API access delegation.
 
 ## Why It Matters
@@ -13282,7 +13282,7 @@ Layer on top of OAuth 2.0:
 2. Why two-step (code → token)? (Code in URL but token in server-to-server response — keeps secret safe)
 3. What's PKCE? (Cryptographic proof preventing intercepted code from being used)`,
 
-    'CORS': `## Definition
+    'What is CORS': `## Definition
 **CORS (Cross-Origin Resource Sharing)** is a browser security mechanism that controls when a web page can make requests to a different origin (different scheme, domain, or port). Without CORS, browsers block cross-origin requests by default for security. CORS provides a way for servers to opt-in to allowing such requests.
 
 ## Why It Matters
@@ -13518,7 +13518,7 @@ const corsOrigin = process.env.NODE_ENV === 'production'
 2. What's a preflight request? (OPTIONS sent before non-simple requests to check authorization)
 3. Why \`*\` not allowed with credentials? (Security — wildcard with cookies could allow any site to act as authenticated user)`,
 
-    'WebSockets': `## Definition
+    'WebSocket vs HTTP': `## Definition
 **WebSockets** provide a full-duplex, bidirectional communication channel over a single TCP connection between a client and server. Unlike HTTP's request/response model, WebSockets allow both sides to send messages anytime — ideal for real-time applications like chat, gaming, and live updates.
 
 ## Why It Matters
@@ -13767,7 +13767,7 @@ wss.on('connection', (ws) => {
 2. How to scale WebSockets? (Sticky sessions, Redis pub/sub for cross-server messaging, specialized services)
 3. WebSocket vs Server-Sent Events? (WS: bidirectional. SSE: server-to-client, simpler, HTTP-based.)`,
 
-    'gRPC': `## Definition
+    'What is gRPC': `## Definition
 **gRPC** is a modern, high-performance Remote Procedure Call (RPC) framework developed by Google. It uses HTTP/2 for transport, Protocol Buffers (protobuf) for serialization, and provides features like streaming, authentication, and load balancing. It's particularly popular for microservices communication.
 
 ## Why It Matters
@@ -14325,7 +14325,7 @@ For microservices:
 2. What's the N+1 problem? (Naive resolver triggers query per item; DataLoader batches)
 3. How is caching different? (HTTP caching ineffective; need application-level (Apollo Client cache))`,
 
-    'Load Balancers': `## Definition
+    'Load Balancing': `## Definition
 A **load balancer** is a system that distributes incoming network traffic across multiple servers to ensure no single server is overwhelmed. It improves application availability, scalability, and performance by spreading load and routing around failures.
 
 ## Why It Matters
@@ -14552,7 +14552,7 @@ Each pod has Envoy sidecar — distributed load balancing.
 2. What's session affinity? (Sticky sessions — same client always to same server)
 3. How does LB detect server failure? (Health checks — HTTP, TCP, custom)`,
 
-    'Reverse Proxy': `## Definition
+    'Forward vs Reverse Proxy': `## Definition
 A **reverse proxy** is a server that sits in front of one or more origin servers and forwards client requests to them. From the client's perspective, the reverse proxy IS the server. Reverse proxies provide load balancing, caching, SSL termination, security, and many other features.
 
 ## Why It Matters
@@ -14812,7 +14812,7 @@ Internet → CDN → API Gateway → Service Mesh
 2. Why SSL termination at proxy? (Centralized cert management; backend doesn't pay encryption cost)
 3. What's an API gateway? (Specialized reverse proxy for microservice APIs — auth, routing, rate limiting)`,
 
-    'CDN': `## Definition
+    'CDN Explained': `## Definition
 A **CDN (Content Delivery Network)** is a geographically distributed network of servers that deliver web content to users from the location nearest to them. CDNs cache static content (images, videos, CSS, JS) at edge servers, reducing latency and offloading traffic from origin servers.
 
 ## Why It Matters
@@ -15085,7 +15085,7 @@ CDNs provide:
 2. How to invalidate CDN cache? (TTL, manual purge, cache-busting URLs)
 3. What about dynamic content? (Cache short TTL, edge compute, smart caching strategies)`,
 
-    'NAT': `## Definition
+    'What is NAT': `## Definition
 **NAT (Network Address Translation)** is a method of remapping IP addresses by modifying network address information in packet headers as they pass through a router. It allows multiple devices on a private network to share a single public IP address, enabling efficient use of limited IPv4 addresses.
 
 ## Why It Matters
@@ -15314,7 +15314,7 @@ But:
 1. Why is NAT a "side-effect" firewall? (Internal hosts unreachable without explicit mapping)
 2. What's CGNAT? (Carrier-grade NAT — ISPs share public IPs across many customers)
 3. How does WebRTC handle NAT? (STUN tells public IP; TURN relays if direct fails)`,
-    'Firewall': `## Definition
+    'What is Firewall': `## Definition
 A **firewall** is a network security system that monitors and controls incoming and outgoing traffic based on predetermined security rules. It establishes a barrier between trusted internal networks and untrusted external networks (like the internet), permitting or blocking data packets based on a set of policies.
 
 ## Why It Matters
@@ -15386,7 +15386,7 @@ iptables -P INPUT DROP
 2. What's a WAF? (Web Application Firewall — Layer 7, inspects HTTP traffic)
 3. Difference between firewall and IDS? (Firewall blocks; IDS detects/alerts)`,
 
-    'VPN': `## Definition
+    'What is VPN': `## Definition
 A **Virtual Private Network (VPN)** creates an encrypted tunnel between a client and a server (or between two networks) over a public network like the internet. It allows remote users to securely access resources as if they were on the local network, and protects data from eavesdroppers.
 
 ## Why It Matters
@@ -15830,7 +15830,7 @@ The MAC/IP distinction is fundamental to how networking works — local delivery
 2. What's ARP? (Maps IP → MAC on local network)
 3. Why MAC at all if IP works? (LANs predate IP; Layer 2 is needed for local switching)`,
 
-    'ARP': `## Definition
+    'What is ARP': `## Definition
 **ARP (Address Resolution Protocol)** is the protocol used to map an IP address to a MAC address on a local network segment. When a device wants to send a packet to another device on its LAN, it uses ARP to discover the recipient's MAC address from its IP address.
 
 ## Why It Matters
@@ -16102,7 +16102,7 @@ Security groups + NACLs control traffic between them. Public subnet has Internet
 2. What's CIDR? (Classless Inter-Domain Routing — flexible subnet sizes via /N notation)
 3. What's the difference between subnet mask and prefix length? (Same info, different notation: 255.255.255.0 = /24)`,
 
-    'BGP': `## Definition
+    'What is BGP': `## Definition
 **Border Gateway Protocol (BGP)** is the routing protocol that exchanges routing information between Autonomous Systems (ASes) on the internet. It's the protocol that "runs the internet" — every ISP uses it to tell others which IP prefixes they can deliver to. BGP is path-vector (carries full AS path) and policy-based.
 
 ## Why It Matters
