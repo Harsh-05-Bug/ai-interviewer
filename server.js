@@ -10,7 +10,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const connectDB = require('./config/db');
 const { featureCheck } = require('./middleware/featureCheck');
-const seedDetailedAnswers = require('./scripts/seed-detailed-answers');
+
 
 const app = express();
 app.set('trust proxy', 1);
@@ -62,17 +62,6 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
   });
-});
-
-// TEMPORARY — delete this route after seeding is complete
-app.get('/run-seed-detailed', async (req, res) => {
-  try {
-    const result = await seedDetailedAnswers();
-    res.json({ success: true, ...result });
-  } catch (err) {
-    console.error('Seed-detailed failed:', err);
-    res.status(500).json({ success: false, error: err.message });
-  }
 });
 
 // Production static files
