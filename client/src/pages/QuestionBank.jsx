@@ -1,5 +1,7 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 const TOPICS = [
   'All', 'Arrays', 'Strings', 'Linked Lists', 'Stacks & Queues',
@@ -46,6 +48,7 @@ export default function QuestionBank() {
   const [selected, setSelected] = useState(null);
   const [modalLoading, setModalLoading] = useState(false);
   const [showAnswer, setShowAnswer] = useState(false);
+  const [showDetailed, setShowDetailed] = useState(false); // ✅ NEW
 
   useEffect(() => {
     fetchQuestions();
@@ -76,6 +79,7 @@ export default function QuestionBank() {
   const handleSelectQuestion = async (q) => {
     setSelected(q);
     setShowAnswer(false);
+    setShowDetailed(false); // ✅ reset on each open
     setModalLoading(true);
     try {
       const { data } = await axios.get(`/api/questions/${q._id}`, {
@@ -90,6 +94,7 @@ export default function QuestionBank() {
 
   const isTheoryTopic = (t) => CS_TOPICS.includes(t);
   const isTheoryQuestion = (q) => q?.type === 'theory' || isTheoryTopic(q?.topic);
+  const hasDetailedAnswer = (q) => q?.detailedAnswer && q.detailedAnswer.trim().length > 0; // ✅ NEW
 
   return (
     <div className="min-h-screen bg-gray-950 text-white px-4 py-8">
@@ -256,7 +261,7 @@ export default function QuestionBank() {
           <div onClick={() => setSelected(null)}
             className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
             <div onClick={e => e.stopPropagation()}
-              className="bg-gray-900 border border-gray-700 rounded-2xl p-6 max-w-2xl w-full max-h-[85vh] overflow-y-auto">
+              className="bg-gray-900 border border-gray-700 rounded-2xl p-6 max-w-3xl w-full max-h-[85vh] overflow-y-auto">
 
               <div className="flex justify-between items-start mb-4">
                 <div className="flex items-center gap-2 flex-wrap">
@@ -273,6 +278,23 @@ export default function QuestionBank() {
 
               {modalLoading ? (
                 <div className="text-center py-10 text-gray-500">Loading...</div>
+              ) : showDetailed ? (
+                /* ✅ DETAILED ANSWER VIEW */
+                <>
+                  <div className="flex justify-between items-center mb-4">
+                    <h3 className="font-semibold text-sm text-purple-300">📚 Detailed Answer</h3>
+                    <button
+                      onClick={() => setShowDetailed(false)}
+                      className="text-xs bg-gray-800 hover:bg-gray-700 border border-gray-700 px-3 py-1.5 rounded-lg transition">
+                      ← Back to Quick Answer
+                    </button>
+                  </div>
+                  <div className="prose-detailed">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {selected.detailedAnswer}
+                    </ReactMarkdown>
+                  </div>
+                </>
               ) : (
                 <>
                   <div className="flex flex-wrap gap-2 mb-4">
@@ -299,6 +321,16 @@ export default function QuestionBank() {
                         <div className="bg-gray-800/50 border border-gray-700 rounded-xl p-4 text-gray-300 text-sm leading-relaxed whitespace-pre-line">
                           {selected.answer}
                         </div>
+                      )}
+
+                      {/* ✅ DETAILED ANSWER BUTTON */}
+                      {hasDetailedAnswer(selected) && (
+                        <button
+                          onClick={() => setShowDetailed(true)}
+                          className="w-full mt-3 flex items-center justify-between bg-gradient-to-r from-indigo-500/10 to-purple-500/10 border border-indigo-500/30 hover:border-indigo-400 rounded-xl px-4 py-3 text-sm font-medium text-indigo-300 transition">
+                          <span>📚 Show Detailed Answer (Interview-Ready)</span>
+                          <span>→</span>
+                        </button>
                       )}
                     </div>
                   )}
@@ -352,6 +384,98 @@ export default function QuestionBank() {
           </div>
         )}
       </div>
+
+      {/* ✅ Markdown styling for the detailed answer view (dark theme) */}
+      <style>{`
+        .prose-detailed {
+          color: #e5e7eb;
+          line-height: 1.7;
+          font-size: 0.9rem;
+        }
+        .prose-detailed h2 {
+          color: #c4b5fd;
+          font-size: 1.05rem;
+          font-weight: 600;
+          margin-top: 1.5rem;
+          margin-bottom: 0.5rem;
+          padding-bottom: 0.35rem;
+          border-bottom: 1px solid #374151;
+        }
+        .prose-detailed h2:first-child { margin-top: 0; }
+        .prose-detailed h3 {
+          color: #a78bfa;
+          font-size: 0.95rem;
+          font-weight: 600;
+          margin-top: 1rem;
+          margin-bottom: 0.4rem;
+        }
+        .prose-detailed h4 {
+          color: #93c5fd;
+          font-size: 0.9rem;
+          font-weight: 600;
+          margin-top: 0.75rem;
+          margin-bottom: 0.3rem;
+        }
+        .prose-detailed p { margin: 0.65rem 0; color: #d1d5db; }
+        .prose-detailed strong { color: #f9fafb; font-weight: 600; }
+        .prose-detailed ul, .prose-detailed ol {
+          margin: 0.5rem 0;
+          padding-left: 1.4rem;
+          color: #d1d5db;
+        }
+        .prose-detailed li { margin: 0.25rem 0; }
+        .prose-detailed code {
+          background: #1f2937;
+          color: #f0abfc;
+          padding: 0.1rem 0.35rem;
+          border-radius: 4px;
+          font-size: 0.85em;
+          font-family: 'Fira Code', 'Consolas', monospace;
+        }
+        .prose-detailed pre {
+          background: #0f172a;
+          border: 1px solid #1e293b;
+          padding: 0.9rem;
+          border-radius: 8px;
+          overflow-x: auto;
+          margin: 0.75rem 0;
+          font-size: 0.82rem;
+        }
+        .prose-detailed pre code {
+          background: transparent;
+          color: #e2e8f0;
+          padding: 0;
+        }
+        .prose-detailed table {
+          border-collapse: collapse;
+          margin: 0.75rem 0;
+          width: 100%;
+          font-size: 0.85rem;
+        }
+        .prose-detailed th, .prose-detailed td {
+          border: 1px solid #374151;
+          padding: 0.4rem 0.65rem;
+          text-align: left;
+        }
+        .prose-detailed th {
+          background: #1f2937;
+          color: #f9fafb;
+          font-weight: 600;
+        }
+        .prose-detailed td { color: #d1d5db; }
+        .prose-detailed blockquote {
+          border-left: 3px solid #8b5cf6;
+          padding-left: 0.85rem;
+          margin: 0.75rem 0;
+          color: #9ca3af;
+          font-style: italic;
+        }
+        .prose-detailed hr {
+          border: none;
+          border-top: 1px solid #374151;
+          margin: 1rem 0;
+        }
+      `}</style>
     </div>
   );
 }
