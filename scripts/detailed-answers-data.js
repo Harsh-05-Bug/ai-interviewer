@@ -22230,6 +22230,5405 @@ ClientToken=<uuid>
 1. Why client-generated UUID? (Stable across retries; client knows it's the same operation)
 2. What if same key but different body? (Server should reject; signals client bug)
 3. How long retain keys? (Long enough to outlive normal retry windows; 24h common)`,
+
+  'Design URL Shortener': `## Functional Requirements
+- Given a long URL, generate a short URL (e.g., \`https://tinyurl.com/abc123\`)
+- Redirect from short URL → original long URL
+- Custom aliases (optional, e.g., \`tinyurl.com/my-link\`)
+- Link expiration (optional TTL)
+- Analytics: click count, geographic distribution
+
+## Non-Functional Requirements
+- **Scale**: 100M new URLs/month, 10B existing URLs over 5 years
+- **Read:Write ratio**: ~100:1 (most URLs are read far more than created)
+- **Latency**: < 100ms for redirect (it's the critical path — slow redirects break UX)
+- **Availability**: 99.99% — links go in emails, social media, business cards
+- **Durability**: a URL must never be lost or repurposed
+
+## Capacity Estimation
+\`\`\`
+Writes:  100M / month  = ~40 URLs/sec
+Reads:   100 × writes  = ~4,000 redirects/sec  (peak ~10x = 40,000/sec)
+
+Storage per URL: ~500 bytes (long URL + short code + metadata + timestamps)
+5-year storage:  10B × 500 = 5 TB
+
+Bandwidth (read): 4,000 × 500 = 2 MB/sec
+Cache (hot 20%): 10B × 20% × 500 = 1 TB hot data → cache ~100GB of top 1%
+\`\`\`
+
+## API Design
+\`\`\`
+POST /api/shorten
+  Body: { longUrl: "...", customAlias?: "...", expiresIn?: seconds }
+  Response: { shortUrl: "https://tinyurl.com/abc123", expiresAt: "..." }
+
+GET  /:shortCode
+  Response: 301/302 redirect → longUrl
+
+DELETE /api/links/:shortCode
+  Auth required, owner only
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+        ┌─────────────┐
+        │   Client    │
+        └──────┬──────┘
+               │
+        ┌──────▼──────┐
+        │     CDN     │  (caches redirects at edge)
+        └──────┬──────┘
+               │
+        ┌──────▼──────┐
+        │ Load Balancer│
+        └──────┬──────┘
+               │
+       ┌───────┼────────┐
+       ▼       ▼        ▼
+   ┌────────┐    ┌────────┐
+   │Write API│   │Read API │  (separate so reads don't compete with writes)
+   └────┬───┘    └────┬───┘
+        │             │
+        │       ┌─────▼──────┐
+        │       │   Redis    │ ← hot redirects (< 1ms)
+        │       └─────┬──────┘
+        │             │ miss
+        ▼             ▼
+   ┌──────────────────────────┐
+   │      Database            │
+   │  (sharded by shortCode)  │
+   └──────────────────────────┘
+                │
+                ▼
+        ┌──────────────┐
+        │  Analytics   │  (Kafka → ClickHouse, async)
+        └──────────────┘
+\`\`\`
+
+## Database Schema
+\`\`\`sql
+CREATE TABLE urls (
+  short_code  VARCHAR(10) PRIMARY KEY,
+  long_url    TEXT NOT NULL,
+  user_id     BIGINT,
+  created_at  TIMESTAMP,
+  expires_at  TIMESTAMP,
+  click_count BIGINT DEFAULT 0
+);
+CREATE INDEX idx_user ON urls(user_id);
+\`\`\`
+**Sharding**: hash \`short_code\` → 64 shards. Even distribution because short codes are randomized.
+
+## Detailed Component Design
+**Short code generation** — three options:
+
+| Approach | Pros | Cons |
+|---|---|---|
+| Hash long URL (MD5 first 6 bytes) | Idempotent, dedupes | Collisions need handling |
+| Counter + base62 | No collisions, sequential | Predictable; needs distributed counter |
+| Random base62 (7 chars) | Unpredictable, ~62^7 = 3.5T space | Need to retry on collision |
+
+**Recommended: Random base62 with collision check.** 7 characters → 3.5 trillion possible codes. At 10B URLs, collision probability is negligible. On INSERT conflict, retry with new code.
+
+**Redirect path** (the hot path):
+1. Request hits CDN. If cached and valid TTL → return immediately.
+2. CDN miss → API server. Check Redis. If hit → return + record analytics async.
+3. Redis miss → DB query. Write back to Redis with TTL=24h. Return.
+4. Analytics write goes to Kafka, never blocks the redirect.
+
+## Scaling Strategy
+- **CDN caching**: 301 redirects can be cached aggressively at edge. Most reads never hit your servers.
+- **Redis cluster**: 100GB cache holds the top 1% of URLs (which serve 90% of traffic — Pareto).
+- **DB sharding**: by \`short_code\` hash. Each shard handles ~600 URLs/sec, well within Postgres limits.
+- **Read replicas**: 5x replicas per shard for the long tail of cache misses.
+- **Async analytics**: never block redirects on click counting.
+
+## Trade-offs & Bottlenecks
+- **301 vs 302**: 301 (permanent) lets browsers cache, reducing server load — but you lose analytics for cached redirects. 302 forces every click to hit your server. Most use 302 for analytics; 301 for static content.
+- **Custom aliases**: enable them but rate-limit (1/user/min) to prevent squatting. Reserved word list (admin, api, etc.).
+- **Bottleneck**: the analytics pipeline. 40k redirects/sec × multiple events = serious Kafka throughput. Use sampling for non-paying users.
+
+## Follow-up Questions
+1. **How do you prevent abuse?** Rate-limit per IP/user. Scan submitted URLs against malware/phishing databases (Google Safe Browsing API). Allow user reports.
+2. **What if a URL needs to be deleted?** Soft delete with \`is_deleted\` flag. Redirect returns 410 Gone instead of 404 — search engines de-index faster.
+3. **How would you handle a viral link?** Hot-key problem. Cache aggressively at CDN. If a single key spikes, replicate it across multiple Redis nodes (consistent hashing with virtual nodes helps).
+4. **How to migrate to a new short code length?** Old codes stay valid forever (durability requirement). New URLs use longer codes once ~50% of namespace is exhausted.
+5. **Analytics at scale?** Real-time dashboards via Kafka → Flink → Redis. Long-term storage in ClickHouse for queries like "clicks by country last 30 days."`,
+
+  'Design Twitter': `## Functional Requirements
+- Post a tweet (text up to 280 chars, optional media)
+- Follow/unfollow users
+- Home timeline: tweets from people you follow, reverse chronological
+- User timeline: a specific user's tweets
+- Like, retweet, reply
+- Search (basic)
+
+## Non-Functional Requirements
+- **Scale**: 500M users, 200M DAU
+- **Posts**: 500M tweets/day = ~6,000/sec average, ~25,000/sec peak
+- **Reads**: 100x writes — timeline reads dominate (~600,000/sec)
+- **Latency**: timeline load < 200ms p99
+- **Availability**: 99.99% — partial degradation OK (e.g., search down, timeline up)
+- **Eventual consistency** acceptable for timelines (a tweet appearing 1-2 sec late is fine)
+
+## Capacity Estimation
+\`\`\`
+Tweets/day:    500M  →  ~6K/sec write, ~25K/sec peak
+Reads/sec:     ~600K timeline loads (avg 20 tweets each = 12M tweet fetches/sec)
+
+Storage per tweet: ~300 bytes text + 100 bytes metadata = 400 bytes
+Daily storage:     500M × 400 = 200 GB/day
+5-year storage:    ~365 TB (compressed/archived old tweets to cold storage)
+
+Media: 10% of tweets have images, avg 200KB → 10 TB/day → CDN + object store
+\`\`\`
+
+## API Design
+\`\`\`
+POST /api/tweets
+  Body: { text, mediaIds?: [...] }
+
+GET  /api/timeline/home?cursor=...&limit=20
+GET  /api/timeline/user/:userId?cursor=...&limit=20
+GET  /api/tweets/:id
+
+POST /api/follow/:userId
+POST /api/tweets/:id/like
+POST /api/tweets/:id/retweet
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+   Client
+     │
+     ▼
+  ┌────────┐    ┌──────────────┐
+  │API GW  │◄───│ Auth Service │
+  └───┬────┘    └──────────────┘
+      │
+   ┌──┴───────────────────────────┐
+   ▼              ▼                ▼
+┌──────┐    ┌──────────┐    ┌──────────┐
+│Tweet │    │ Timeline │    │  Social  │
+│Service│   │ Service  │    │ Graph    │
+└──┬───┘    └────┬─────┘    └────┬─────┘
+   │             │                │
+   │             ▼                │
+   │        ┌─────────┐           │
+   │        │  Redis  │ ← timelines cached
+   │        └────┬────┘
+   │             │
+   ▼             ▼               ▼
+┌────────────────────────────────────┐
+│     Sharded DB (Cassandra)          │
+│  tweets / users / follows / likes   │
+└────────────────────────────────────┘
+        ▲
+        │
+   Fanout Service (Kafka consumer)
+        ▲
+        │
+   Tweet write event → Kafka
+\`\`\`
+
+## Database Schema
+\`\`\`
+tweets (Cassandra, partition: user_id, cluster: tweet_id DESC)
+  user_id, tweet_id (snowflake), text, media_urls, created_at
+
+follows (Cassandra, partition: follower_id)
+  follower_id, followee_id, created_at
+
+home_timeline (Redis sorted set per user)
+  Key: timeline:{user_id}, score: tweet_timestamp, value: tweet_id
+
+user_timeline (Cassandra, partition: user_id)
+  user_id, tweet_id, created_at
+
+likes (Cassandra)
+  tweet_id, user_id  (counter table for like counts)
+\`\`\`
+
+## Detailed Component Design
+**The big architectural decision: fanout-on-write vs fanout-on-read**
+
+| | Fanout-on-write (push) | Fanout-on-read (pull) |
+|---|---|---|
+| When | Tweet written | Timeline requested |
+| Cost | High write cost (1 tweet → N follower timelines) | High read cost (gather + merge from N followees) |
+| Latency | Reads = O(1) | Reads = O(followees) |
+| Best for | Average users (< 10K followers) | Celebrities (millions of followers) |
+
+**Hybrid approach (what Twitter actually uses)**:
+- Average user posts → fanout-on-write to all followers' Redis timelines
+- Celebrity posts (>10K followers) → fanout-on-read; their tweets are pulled into followers' timelines at read time
+- A follower of a celebrity → merge their pre-computed timeline with celebrity tweets at read time
+
+**Tweet creation flow**:
+1. Client → API GW → Tweet Service
+2. Tweet Service writes to Cassandra (user_timeline + tweets table)
+3. Tweet Service publishes \`tweet_created\` event to Kafka
+4. Fanout Service consumes event:
+   - If author is non-celebrity: fetch followers from Social Graph, push tweet_id to each follower's Redis sorted set (LPUSH + LTRIM to 1000 most recent)
+   - If celebrity: skip — handled at read time
+
+**Timeline read flow**:
+1. Get \`timeline:{user_id}\` from Redis (top 1000 tweet IDs)
+2. Identify celebrity follows (< 50 typically). Fetch their recent tweets directly.
+3. Merge by timestamp.
+4. Hydrate tweet IDs → full tweet objects (batch get from Cassandra/cache).
+
+## Scaling Strategy
+- **Tweets table**: shard by user_id. ~5K writes/sec/shard → 10 shards.
+- **Timeline cache (Redis)**: cluster mode, hash by user_id. Cap each timeline at last 1000 tweets.
+- **Hot key problem**: A celebrity's tweet ID is read by millions. Use replicated reads — cache the same tweet object in 5+ Redis nodes, randomly select.
+- **Geo-replication**: home timeline served from nearest data center.
+- **Search**: separate Elasticsearch cluster, indexed asynchronously from Kafka stream.
+
+## Trade-offs & Bottlenecks
+- **Eventual consistency**: a tweet may take 1-2 seconds to appear in followers' timelines. Acceptable.
+- **Fanout amplification**: a user with 1M followers triggers 1M Redis writes per tweet. That's 25K tweets/sec × 1M = 25B writes if everyone were a celebrity. Hybrid model is essential.
+- **Storage cost**: pre-computed timelines × 200M users × 1000 tweets each = ~200B tweet IDs cached. Justifiable at Twitter scale.
+- **Bottleneck**: the social graph service. Every fanout needs follower lists. Cache aggressively, paginate large follower sets.
+
+## Follow-up Questions
+1. **How do you handle a deleted tweet?** Don't update fanouts (too expensive). Mark deleted in tweets table; the read path filters them out at hydration time.
+2. **What about replies and threading?** Each reply has a \`reply_to_tweet_id\`. Conversations are reconstructed at read time from this graph.
+3. **How does search work?** Async Elasticsearch indexing. Search is "best effort" — slight lag from real-time is acceptable.
+4. **What if Redis goes down?** Fallback to fanout-on-read everywhere. Slow, but functional. Reseed Redis from Cassandra.
+5. **How would you implement "Who to Follow"?** Offline graph mining (Spark): mutual followers, shared interests via tweet embeddings. Precomputed daily, served from cache.
+6. **How to handle abuse/spam?** Rate-limit tweet creation. ML-based content scoring. Shadowban suspected spam (visible to author, hidden from others).`,
+
+  'Design Instagram': `## Functional Requirements
+- Upload photos/videos with captions
+- Follow users; news feed of followed users' posts
+- Like, comment, save posts
+- Stories (24-hour ephemeral content)
+- Direct messages (basic)
+- Search hashtags, users
+- Explore page (recommendations)
+
+## Non-Functional Requirements
+- **Scale**: 2B users, 500M DAU, 100M posts/day
+- **Read-heavy**: feed views, story views ≫ posts. ~100:1 read:write
+- **Latency**: feed load < 300ms, image load < 500ms (CDN)
+- **Availability**: 99.99%
+- **Durability**: photos must never be lost
+- **Eventual consistency** on feeds is acceptable
+
+## Capacity Estimation
+\`\`\`
+Posts/day:    100M  → ~1,200/sec average, ~5K/sec peak
+Avg post size: 3 MB (compressed JPEG/MP4 thumbnail)
+Storage/day:   300 TB raw → 5-year cumulative ~500 PB
+Bandwidth:    500M DAU × 50 photos/day × 3 MB = 75 PB/day delivered (CDN)
+
+Feed reads: 500M users × 30 feed loads/day × 20 posts = 300B post lookups/day = 3.5M/sec
+\`\`\`
+
+## API Design
+\`\`\`
+POST /api/posts          { caption, mediaIds, location? }
+GET  /api/feed?cursor=...&limit=20
+GET  /api/users/:id/posts?cursor=...
+POST /api/posts/:id/like
+POST /api/posts/:id/comments    { text }
+POST /api/follow/:userId
+POST /api/stories         { mediaId }   // expires after 24h
+GET  /api/stories/feed
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Client
+  │
+  ▼
+API Gateway ──► Auth Service
+  │
+  ├─► Post Service ──► Cassandra (posts) + Kafka (fanout events)
+  │       │
+  │       └─► Media Upload ──► S3 + Image Processor (resize, transcode) ──► CDN
+  │
+  ├─► Feed Service ──► Redis (precomputed feeds) + ML Ranker
+  │
+  ├─► Story Service ──► Redis (TTL=24h, ephemeral)
+  │
+  ├─► Social Graph ──► Cassandra (follows)
+  │
+  ├─► Search Service ──► Elasticsearch
+  │
+  └─► Notification Service ──► Kafka → push/email/in-app
+\`\`\`
+
+## Database Schema
+\`\`\`
+posts (Cassandra, partition: user_id, cluster: post_id DESC)
+  post_id (snowflake), user_id, caption, media_urls[], created_at, like_count
+
+follows (Cassandra)
+  follower_id (partition), followee_id
+
+likes (Cassandra)
+  post_id (partition), user_id, created_at
+
+comments (Cassandra)
+  post_id (partition), comment_id, user_id, text, created_at
+
+stories (Redis with TTL=86400s + S3 for media)
+  Key: stories:{user_id}, value: list of {story_id, media_url, posted_at}
+
+media metadata (Postgres or DynamoDB)
+  media_id, owner_id, s3_key, type (image/video), variants (thumbnails)
+\`\`\`
+
+## Detailed Component Design
+
+**Photo upload flow**:
+1. Client requests pre-signed S3 URL from Media Service
+2. Client uploads directly to S3 (bypasses your servers — saves bandwidth)
+3. S3 triggers Lambda → Image Processor: generates thumbnails (150px, 320px, 1080px), runs NSFW classifier
+4. Variants written to S3, paths stored in media metadata DB
+5. CDN warmed with new images
+6. Client calls POST /api/posts with mediaId once processing completes
+
+**Feed generation — same hybrid as Twitter**:
+- Average users: fanout-on-write. Post created → enqueue Kafka event → fanout worker pushes post_id to each follower's Redis feed cache.
+- Celebrity users (>500K followers): fanout-on-read. Their posts are merged at read time.
+- ML ranker re-scores feed: not pure chronological — engagement prediction, recency, diversity.
+
+**Stories**:
+- Stored in Redis with TTL=24h. After expiry, key auto-evicts.
+- Story media on S3; S3 lifecycle policy archives or deletes after 30 days.
+- View tracking: \`SADD story_viewers:{story_id} {user_id}\`. Capped at 10K viewers shown.
+
+**Notifications**:
+- Like/comment/follow event → Kafka → Notification Service
+- Aggregation: "John and 5 others liked your post" — group within 1 min window
+- Push: APNS/FCM. Email batched daily. In-app counter via WebSocket.
+
+## Scaling Strategy
+- **Media on S3 + multi-region CDN**: 99% of bandwidth served from edge. Origin S3 sees almost no read traffic.
+- **Image variants**: pre-generate sizes. Mobile gets thumbnails, web gets full-res. Saves enormous bandwidth.
+- **Feed cache (Redis cluster)**: hash by user_id, shard. 500M users × 1000 cached post_ids = 500B IDs ≈ 4 TB Redis.
+- **Cassandra for posts**: writes scale linearly with shards. Reads via partition key (user timeline) are O(1).
+- **ML feed ranking**: model served via gRPC, results cached for 30 sec per user.
+
+## Trade-offs & Bottlenecks
+- **Cost**: storage + CDN dominate. Heavy compression, aggressive lifecycle policies (archive cold media to Glacier), de-dupe identical uploads.
+- **Stories load**: 24h TTL means a giant write spike at peak hours (evening). Capacity-plan Redis for peak, not average.
+- **Feed freshness vs cost**: pure ML re-ranking on every feed load is expensive. Cache ranked feed for 60 sec; refresh on pull-to-refresh.
+- **Bottleneck**: image processing pipeline. Backlog during traffic spikes. Auto-scale workers based on Kafka lag.
+
+## Follow-up Questions
+1. **How to detect duplicate uploads?** Compute perceptual hash (pHash) on upload. Compare to recent hashes within user's posts.
+2. **How to handle a viral post?** Hot-key on Redis like count. Use counter sharding: split across 16 keys, sum on read.
+3. **Reels (short videos)?** Separate ranking model, separate ingestion pipeline (more transcoding). Same fanout/CDN architecture.
+4. **What about content moderation?** ML classifier on upload (NSFW, violence). User reports. Shadowban or remove. Audit log for legal compliance.
+5. **How to test changes safely?** Feature flags + A/B testing. Shadow traffic to new ranker; compare engagement metrics before rollout.
+6. **GDPR delete request?** User triggers async job: cascade-delete posts, stories, comments, likes. Tombstone records for 30 days, then hard delete. CDN purge.`,
+
+  'Design WhatsApp': `## Functional Requirements
+- 1-on-1 messaging
+- Group chats (up to 1024 members)
+- Online/last-seen status
+- Read receipts (single tick → double tick → blue tick)
+- Media sharing (images, video, voice notes, documents)
+- End-to-end encryption (E2EE)
+- Voice & video calls (basic; not the focus here)
+
+## Non-Functional Requirements
+- **Scale**: 2B users, 100B messages/day
+- **Latency**: < 100ms message delivery (it's chat — feels instant)
+- **Availability**: 99.99% — messaging is mission-critical
+- **Durability**: never lose a message; deliver-once semantics
+- **Privacy**: E2EE; servers cannot read message content
+- **Battery efficiency**: clients are mobile, can't poll constantly
+
+## Capacity Estimation
+\`\`\`
+Messages/day:  100B  →  ~1.2M/sec average, ~5M/sec peak
+Avg message:   ~200 bytes (encrypted blob + metadata)
+Daily storage: 100B × 200 = 20 TB/day  (kept until delivery, then deleted)
+
+Connections:   500M concurrent online users
+Per-server:    ~50K WebSocket connections each → need ~10K servers
+\`\`\`
+
+## API & Protocol Design
+**WhatsApp uses XMPP-like long-lived persistent connections, not REST.**
+
+\`\`\`
+WebSocket / TCP+TLS persistent connection per device.
+Frames:
+  AUTH       { user_id, auth_token, device_id }
+  SEND       { msg_id, to, payload (encrypted), timestamp }
+  ACK        { msg_id, status: sent|delivered|read }
+  TYPING     { to, isTyping }
+  PRESENCE   { user_id, status }
+\`\`\`
+
+For media: separate HTTPS upload to media servers, then send the URL+key in the encrypted message.
+
+## High-Level Architecture
+\`\`\`
+Client (mobile)
+  │
+  │ persistent WebSocket
+  ▼
+┌──────────────────────┐
+│  Connection Server   │  ← stateful: holds N WebSockets
+│  (one of 10,000)     │
+└──────────┬───────────┘
+           │
+           │ pub/sub
+           ▼
+   ┌──────────────┐       ┌──────────────┐
+   │  Routing     │◄──────│  User → Server│  (Redis)
+   │  Service     │       │  Mapping      │
+   └──────┬───────┘       └──────────────┘
+          │
+          │ if recipient offline
+          ▼
+   ┌──────────────────┐
+   │  Message Queue   │ ← Kafka, persists undelivered messages
+   │  (per recipient) │
+   └────────┬─────────┘
+            │
+            ▼
+   ┌──────────────────┐
+   │  Media Server    │ ← S3 + CDN
+   └──────────────────┘
+\`\`\`
+
+## Database Schema
+\`\`\`
+Users (Postgres)
+  user_id, phone_number, public_key, last_seen, status
+
+Devices (Postgres)
+  device_id, user_id, push_token (APNS/FCM), pre_keys[]
+
+Messages (Cassandra) — only stored until delivered; then DELETED
+  msg_id (snowflake), sender_id, recipient_id, encrypted_payload, created_at, status
+
+Group Metadata (Postgres)
+  group_id, name, members[], admins[], created_at
+
+Group Membership (Cassandra, partition: group_id)
+  group_id, user_id, role, joined_at
+
+Online Map (Redis)
+  user_id → { server_id, connected_at }
+
+Undelivered Queue (Kafka, topic per recipient_id mod N)
+\`\`\`
+
+## Detailed Component Design
+
+**Connection Server**:
+- Each holds 50-100K persistent TCP+TLS connections
+- Stateful: maintains user_id → socket map locally
+- Heartbeats every 30s; if client misses 2, mark offline
+- On connect: register \`user_id → server_id\` in Redis
+
+**Sending a message** (1-on-1):
+1. Client A's app sends \`SEND\` frame over its socket
+2. Connection Server (CS-A) receives it, generates server-side \`msg_id\`
+3. Persists to Messages table (Cassandra) with status=sent
+4. Looks up recipient in Online Map: \`user_id → server_id\`
+5. **If online** (CS-B): publishes to CS-B's pub/sub channel; CS-B writes to recipient's socket
+6. **If offline**: pushes to Kafka queue partitioned by recipient_id; sends APNS/FCM push notification
+7. Recipient's client ACKs delivery; CS-B forwards ACK to CS-A via routing; CS-A pushes to A's socket
+8. Once delivered, message can be deleted from server (E2EE means server has nothing useful anyway)
+
+**Group chat (1 → N delivery)**:
+- Server fans out: for each group member, the same encrypted-per-recipient payload is delivered. (E2EE in groups: sender encrypts separately for each member's key, OR uses a shared sender-key — Signal Protocol's group mode.)
+
+**End-to-End Encryption (Signal Protocol)**:
+- On install, client generates identity key + pre-keys, uploads public keys to server
+- Sender fetches recipient's pre-key bundle, derives shared secret (X3DH)
+- Subsequent messages use Double Ratchet — each message has unique key
+- Server only sees opaque bytes
+
+**Read receipts**:
+- Recipient client sends READ ack when message displayed
+- Server forwards to sender. Sender's UI updates: ✓ → ✓✓ → ✓✓ (blue)
+
+**Last-seen / online status**:
+- Online: heartbeat-based. Recorded in Redis with TTL=60s.
+- Last-seen: written to Postgres on disconnect.
+- Privacy settings allow hiding from non-contacts.
+
+## Scaling Strategy
+- **Connection servers scale horizontally**: 50K conns × 10K servers = 500M concurrent
+- **Routing service** uses Redis for online map. Hash by user_id.
+- **Message storage is short-lived** (deleted after delivery) — keeps DB small. Active table: only undelivered.
+- **Kafka for offline queue**: partition by recipient_id. Retain for 30 days.
+- **Media on CDN**: voice notes/photos uploaded to S3, downloaded via CDN. Encrypted client-side; servers store opaque bytes.
+- **Multi-region**: connection servers per region. Cross-region routing via internal backbone.
+
+## Trade-offs & Bottlenecks
+- **Stateful connection servers complicate deploys**: graceful drain on rolling deploy — disconnect users gracefully, they reconnect to a new server.
+- **E2EE limits server features**: no server-side search, no easy backup, message encryption keys must be handled carefully on device backup.
+- **Group fanout**: 1024 members means up to 1024 individual deliveries per group message. Use sender-keys to reduce.
+- **Bottleneck**: APNS/FCM push delivery. Outsourced to Apple/Google; you queue locally but they rate-limit.
+
+## Follow-up Questions
+1. **What happens if two devices are logged in?** WhatsApp Multi-Device: each device has its own keys. Sender encrypts to all recipient devices. Linked devices sync via primary device's keys.
+2. **How is "delivered" different from "read"?** Delivered = client received; Read = client displayed in UI. Two separate ACKs.
+3. **How do you back up encrypted chats?** Optional encrypted backup to iCloud/Drive with user-controlled key (separate password). Trade-off: if user forgets key, history is lost.
+4. **What if the recipient never comes online?** Queue retained 30 days, then dropped. Client gets notified messages are lost.
+5. **How do voice/video calls work?** WebRTC peer-to-peer for media; STUN/TURN servers for NAT traversal; signaling over the chat connection.
+6. **Spam prevention?** Rate-limit messages per sender. ML on metadata (frequency, contacts, reports). Number-level bans.
+7. **How does a phone number change work?** "Change Number" feature: re-registers; old contacts auto-updated via Signal Protocol identity transfer.`,
+
+  'Design YouTube': `## Functional Requirements
+- Upload videos
+- View videos with adaptive bitrate streaming
+- Search videos by title/tags/description
+- Comments, likes/dislikes, subscriptions
+- Recommended/trending videos
+- Channels and playlists
+- Live streaming (basic)
+
+## Non-Functional Requirements
+- **Scale**: 2.5B users, 1B hours watched/day, 500 hours uploaded/min
+- **Read-heavy**: ~1000:1 view:upload ratio
+- **Latency**: video start < 2 seconds (TTFB), search < 200ms
+- **Availability**: 99.95%
+- **Durability**: uploaded videos must never be lost
+- **Quality**: adaptive streaming across 144p → 4K, mobile networks → fiber
+
+## Capacity Estimation
+\`\`\`
+Uploads:     500 hours/min  → 30,000 hours/hour → 720,000 hours/day
+Avg upload:  500 MB (after compression)
+Daily ingestion: ~360 PB raw before transcoding
+After transcoding to 6 resolutions × multiple codecs: ~5-10x storage
+Total storage: exabytes (~1.5+ EB historical)
+
+Views:       5B/day ≈ 60K/sec average
+Bandwidth:   avg 5 Mbps × 50M concurrent streams = 250 Tbps  ← CDN essential
+\`\`\`
+
+## API Design
+\`\`\`
+POST /api/videos/upload-url     → returns pre-signed S3 URL
+POST /api/videos                  { title, description, tags, mediaId }
+GET  /api/videos/:id              → metadata + manifest URL
+GET  /api/videos/:id/manifest.mpd → DASH/HLS manifest
+GET  /api/search?q=...&filter=...
+POST /api/videos/:id/like
+POST /api/videos/:id/comments
+POST /api/subscribe/:channelId
+GET  /api/recommendations?user=...
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+              Client (web/mobile/TV)
+                    │
+                    ▼
+              ┌───────────┐
+              │    CDN    │ ◄─── 99% of video traffic
+              └─────┬─────┘
+                    │ miss
+                    ▼
+              ┌───────────────┐
+              │  Origin Edge  │
+              └─────┬─────────┘
+                    │
+        ┌───────────┼─────────────┐
+        ▼           ▼              ▼
+   ┌────────┐  ┌────────┐     ┌──────────┐
+   │ Upload │  │ Video  │     │  Search  │
+   │Service │  │ Meta   │     │   API    │
+   └───┬────┘  └────┬───┘     └────┬─────┘
+       │            │                │
+       │       ┌────▼─────┐    ┌────▼──────┐
+       │       │ Postgres │    │Elasticsearch│
+       │       │  Bigtable │    └───────────┘
+       │       └──────────┘
+       ▼
+   ┌────────────────────────┐
+   │  Transcoding Pipeline  │ ← Kafka work queue
+   │  (worker farm)         │
+   └────────┬───────────────┘
+            ▼
+   ┌──────────────────┐
+   │ Object Storage   │  (multi-region, replicated)
+   │ (Colossus / S3)  │
+   └──────────────────┘
+            │
+            ▼
+   ┌──────────────────┐
+   │  Recommendation  │ ← ML offline batch + online ranking
+   │  Service         │
+   └──────────────────┘
+\`\`\`
+
+## Database Schema
+\`\`\`
+videos (Bigtable / Spanner)
+  video_id, channel_id, title, description, tags[], duration_sec,
+  uploaded_at, status (processing|live|removed), view_count, like_count
+
+video_variants (per video)
+  video_id, resolution (144p..4K), codec, bitrate, segment_urls[]
+
+channels
+  channel_id, name, subscriber_count, owner_user_id
+
+subscriptions (Cassandra, partition: subscriber_id)
+  subscriber_id, channel_id, subscribed_at
+
+views (analytics, ClickHouse / Bigtable counter)
+  video_id, watch_time_sec, geo, device, day
+
+comments (Cassandra, partition: video_id)
+  video_id, comment_id, user_id, text, parent_comment_id, created_at
+\`\`\`
+
+## Detailed Component Design
+
+**Upload pipeline**:
+1. Client requests upload URL → Upload Service issues pre-signed multipart S3 URL
+2. Client uploads directly to object storage (chunked, resumable)
+3. Object storage triggers event → Kafka topic \`video.uploaded\`
+4. Transcoding Service picks up job:
+   - Splits video into 10-second segments
+   - Transcodes each segment in parallel into multiple resolutions/codecs (H.264, VP9, AV1)
+   - Generates DASH/HLS manifest
+5. Once complete, status flipped to \`live\` in metadata DB
+6. CDN warmed for the video; recommendation pipeline notified
+
+**Streaming (DASH/HLS adaptive bitrate)**:
+- Client downloads manifest (e.g., \`video_id.mpd\`)
+- Manifest lists 6+ quality variants and segment URLs
+- Client measures bandwidth and switches resolution per segment
+- Each segment is a small file (1-5 MB), heavily cached on CDN
+- Range requests for skip/seek
+
+**Search**:
+- Elasticsearch indexes title, description, tags, transcribed audio (for closed captions)
+- Boost by recency, popularity, watch time
+- ML re-ranker for personalization
+
+**Recommendations**:
+- Two-stage system:
+  - **Candidate generation**: from billions of videos, narrow to ~500 candidates per user (fast, embedding-based ANN)
+  - **Ranker**: deep model scoring each candidate using user history, watch context, freshness
+- Offline pipeline trains models on view logs (Spark/TensorFlow on logs)
+- Online inference via TF Serving with sub-100ms latency
+
+## Scaling Strategy
+- **CDN is the primary scale lever**: 99%+ of bytes served from edge. Multi-CDN (Akamai + own + Cloudflare) for redundancy and cost negotiation.
+- **Object storage replication**: multi-region with consistent hashing. Redundancy across availability zones.
+- **Transcoding**: massive worker farm. Auto-scale based on Kafka backlog. Use spot/preemptible VMs to cut cost.
+- **Hot videos**: top 1% of videos serve 99% of traffic. Aggressive edge caching. Pre-warm CDN on viral takeoff.
+- **Metadata DB**: partition by video_id. Read replicas in every region.
+- **Comments / likes**: Cassandra. Counter denormalized to videos table; updated periodically (not on every like — too expensive).
+
+**View count integrity** is a special challenge:
+- Naive: increment counter on every view → impossible at 60K/sec
+- Real solution: log views to Kafka → batch-aggregate hourly → update counter
+- Anti-fraud: detect bot views with ML before counting
+
+## Trade-offs & Bottlenecks
+- **Transcoding cost**: dominant compute cost. Trade-off between number of variants (better experience) and storage/compute (cost).
+- **CDN cost**: dominant bandwidth cost. Strategies: P2P delivery for live, custom CDN for hot regions.
+- **View count accuracy vs latency**: real-time is impossible at scale. Public counter updates every few minutes or hours.
+- **Live streaming**: harder than VOD. Low latency (5s vs 30s) requires specialized infrastructure (LL-HLS, WebRTC).
+- **Bottleneck**: copyright detection (Content ID). Every upload scanned against billions of fingerprints — heavy compute, but mandatory.
+
+## Follow-up Questions
+1. **How do you support resumable uploads?** Multipart upload to S3. Client tracks completed parts; resumes failed parts. Server-side: assemble on completion.
+2. **How does Content ID work?** Audio/video fingerprinting (acoustic + perceptual hash). Match against rights-holder database. Match → revenue share or block.
+3. **How to handle a video going viral?** Auto-detect surge in views/share rate. Pre-warm more CDN regions. Alert content team for moderation review.
+4. **Storage tiering?** Hot (CDN + SSD origin) for popular; warm (HDD origin) for old; cold (tape/Glacier) for archival.
+5. **Comments at scale?** Write-heavy when video trends. Async indexing for moderation. Hide spam comments via ML score.
+6. **Live streaming architecture?** RTMP ingest → transcoder → CMAF/LL-HLS segments to CDN. ~5 second latency. Chat over WebSocket.
+7. **Subtitles/captions?** Auto-generated via speech-to-text on upload. User-uploaded SRT/VTT files. Served alongside video manifest.`,
+
+  'Design Netflix': `## Functional Requirements
+- Stream movies and TV shows on multiple devices
+- User profiles within an account
+- Personalized recommendations
+- Watch history, resume playback across devices
+- Offline downloads (mobile)
+- Adaptive bitrate streaming
+- Multi-language audio + subtitles
+
+## Non-Functional Requirements
+- **Scale**: 250M subscribers, 100M concurrent peak (e.g., new season releases)
+- **Latency**: video start < 2s, smooth playback (no buffering on adequate bandwidth)
+- **Availability**: 99.99% — outages are very public
+- **Quality**: SD → 4K HDR. Adapts to network.
+- **Global**: ~190 countries, multi-CDN
+- **Cost discipline**: bandwidth is the dominant cost
+
+## Capacity Estimation
+\`\`\`
+Concurrent peak: 100M streams
+Avg bitrate:     ~5 Mbps  (mix of mobile SD to 4K)
+Peak bandwidth:  500 Tbps  ← ONLY survivable via CDN at edge
+
+Catalog size:    ~15,000 titles, average 6 episodes × multi-resolution = ~3 PB
+Open Connect (Netflix's own CDN): ~10,000 servers in ISP networks worldwide
+\`\`\`
+
+## API Design
+\`\`\`
+GET  /api/profile/:id/feed       → personalized rows of titles
+GET  /api/title/:id              → metadata (cast, synopsis, episodes)
+GET  /api/title/:id/manifest     → DASH manifest with variants
+POST /api/playback/heartbeat     { profile_id, title_id, position_sec }
+GET  /api/profile/:id/continue   → resume points
+POST /api/title/:id/rate         → thumbs up/down for recommendations
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Client (TV, mobile, web, console)
+  │
+  ▼
+┌──────────────────────────┐
+│  Open Connect (CDN)      │ ← in ISP networks; serves video bytes
+└──────────┬───────────────┘
+           │ initial requests, control plane
+           ▼
+┌──────────────────────────┐
+│   API Gateway / Edge     │  (AWS)
+└──┬──────────┬──────────┬─┘
+   │          │          │
+   ▼          ▼          ▼
+┌─────┐  ┌────────┐  ┌──────────┐
+│Title│  │Playback│  │Recommend.│
+│ Svc │  │ Svc    │  │ Service  │
+└──┬──┘  └───┬────┘  └────┬─────┘
+   │         │             │
+   ▼         ▼             ▼
+┌──────────────────────────────┐
+│   Cassandra / DynamoDB / S3   │
+│   user state, viewing history │
+└──────────────────────────────┘
+   │
+   ▼
+┌─────────────────┐
+│ Encoding Pipeline│ ← transcodes new content into many variants
+└─────────────────┘
+\`\`\`
+
+## Database Schema
+\`\`\`
+titles (Cassandra)
+  title_id, type (movie|series), year, genres, cast, synopsis, ratings_avg
+
+episodes
+  series_id, season, episode_num, episode_id, title, runtime_sec
+
+variants (per title or episode)
+  title_id, resolution, codec, bitrate, audio_track, subtitle_lang, segment_base_url
+
+profiles
+  account_id, profile_id, name, language, parental_lock, taste_vector
+
+viewing_history (Cassandra, partition: profile_id)
+  profile_id, title_id, position_sec, last_watched_at, completed
+
+recommendations (Redis / DynamoDB, precomputed)
+  profile_id → ordered list of (row_label, [title_ids])
+\`\`\`
+
+## Detailed Component Design
+
+**Open Connect — Netflix's secret weapon**:
+- Netflix ships physical servers (Open Connect Appliances) to ISPs for free
+- ISPs install them in their network → Netflix traffic stays on the ISP's local network instead of crossing transit links
+- Each appliance pre-fetches the full popular catalog overnight during off-peak hours
+- Client requests routed to the nearest appliance with the content
+- Result: ~95% cache hit rate at the edge; massively cheaper than commercial CDN
+
+**Playback flow**:
+1. Client requests \`/api/title/:id/manifest\` → API Gateway → Playback Service
+2. Playback Service issues a tokenized manifest pointing to Open Connect appliance URLs
+3. Client streams segments directly from OC appliance
+4. Client sends heartbeats every 30s with playback position
+5. Heartbeat batched into Kafka → updates viewing_history
+6. On pause/stop, last position saved → "Continue Watching" row available across devices
+
+**Adaptive bitrate streaming (per-title encoding)**:
+- Netflix doesn't use one-size-fits-all encoding ladders
+- Each title gets a custom encoding ladder based on content complexity (animation needs fewer bits than action)
+- Result: same quality at lower bitrate → bandwidth savings
+
+**Recommendation system**:
+- Multiple "rows" per profile homepage: Trending, Because You Watched X, New Releases, etc.
+- Each row generated by a different algorithm + ranking
+- Offline: collaborative filtering, matrix factorization, deep models on viewing history
+- Online: re-rank cached candidates based on context (time of day, device)
+- A/B testing pervasive: every user is in dozens of experiments
+
+**Profile-level personalization**:
+- Each profile in an account has its own model state
+- Critical because family members have different tastes
+- "Kids" profile gets a different catalog filter
+
+## Scaling Strategy
+- **Open Connect** absorbs the bulk of traffic at zero marginal bandwidth cost
+- **Multi-CDN fallback**: AWS CloudFront, Akamai, Limelight as failover
+- **Multi-region AWS**: control plane runs in 3+ regions; failover via Eureka service discovery + Hystrix circuit breakers
+- **Chaos Engineering** (Netflix invented this): Chaos Monkey kills random services in production to ensure resilience
+- **Encoding pipeline** runs on AWS Spot instances; thousands of cores transcoding catalog
+
+## Trade-offs & Bottlenecks
+- **Multi-region active-active is expensive**: data replication lag means viewing state may take seconds to sync. Acceptable for "continue watching."
+- **Per-title encoding** trades upfront compute cost for ongoing bandwidth savings — net win at Netflix scale
+- **Recommendations are personalized but not real-time**: refresh every ~6 hours. Live signals (skipping, ratings) factor into next refresh.
+- **DRM**: required by content owners. Adds complexity (Widevine, FairPlay, PlayReady — 3 different DRM systems for different platforms).
+- **Bottleneck**: licensing windows. Some content available in some countries only. Geo-block at API + CDN. Catalog differs per region.
+
+## Follow-up Questions
+1. **How does offline download work?** Encrypted MP4 with embedded license. License has expiry (e.g., 7 days, or 48h once started). DRM enforces playback.
+2. **Why not use AWS CloudFront for video?** Cost. At Netflix scale, custom CDN (Open Connect) is far cheaper. CloudFront used for control plane and fallback.
+3. **How do you A/B test a new UI?** Control plane segments users; serves different home page configurations. Measure engagement metrics per variant.
+4. **What if Open Connect appliance fails?** Client retries; routed to another appliance or AWS-hosted fallback. Health checks remove unhealthy nodes.
+5. **How does subtitle delivery work?** Separate WebVTT files referenced from manifest. Loaded on demand.
+6. **Capacity planning for new season release?** Pre-warm CDN regionally based on expected demand. Stagger availability times if needed. Have absorbed the "Tiger King" / "Squid Game" spikes via this approach.
+7. **How to detect/prevent password sharing?** Device fingerprinting + IP analysis + login pattern. Trade-off: aggressive blocking annoys legit users.`,
+
+  'Design Uber': `## Functional Requirements
+- Riders request rides; drivers accept
+- Real-time location tracking of nearby drivers
+- Trip lifecycle: requested → matched → en route → completed → rated
+- Fare calculation, surge pricing
+- Driver-rider matching optimization (ETA, supply/demand)
+- Payment processing, receipts
+- Trip history
+
+## Non-Functional Requirements
+- **Scale**: 100M MAU, 25M trips/day, 5M active drivers worldwide
+- **Latency**: driver match < 5 seconds; location updates every 4 sec
+- **Availability**: 99.99% — riders need rides during outages
+- **Geo-aware**: every operation is location-bound
+- **Eventual consistency** OK for trip history; strong for active matches and payments
+
+## Capacity Estimation
+\`\`\`
+Trips/day:        25M  →  ~300/sec average, ~3K/sec at peak (Friday evenings)
+Location updates: 5M drivers × 1 update / 4 sec = 1.25M writes/sec
+Storage:          Trip records ~5KB × 25M/day = 125 GB/day
+Driver locations: ephemeral (Redis), no persistence needed long-term
+\`\`\`
+
+## API Design
+\`\`\`
+POST /api/rides/request       { rider_id, pickup, dropoff, vehicle_type }
+                              → returns ride_id, estimated_fare, eta
+
+GET  /api/rides/:id/status    → matched | arriving | in_trip | completed
+POST /api/rides/:id/cancel
+POST /api/drivers/location    { driver_id, lat, lng, heading }   ← every 4s
+POST /api/rides/:id/accept    (driver action)
+POST /api/rides/:id/start
+POST /api/rides/:id/end       { distance, duration } → triggers payment
+GET  /api/rides/history?cursor=...
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Riders / Drivers (mobile)
+        │
+        ▼
+   ┌─────────────┐
+   │  API Gateway│
+   └──────┬──────┘
+          │
+   ┌──────┼──────────────────────────────┐
+   ▼      ▼                              ▼
+┌──────┐ ┌───────────┐    ┌────────────────┐
+│Trip  │ │ Location   │    │ Matching       │
+│Svc   │ │ Service    │    │ Service        │
+└──┬───┘ └────┬──────┘    └────────┬───────┘
+   │          │                     │
+   │          ▼                     ▼
+   │     ┌────────────┐    ┌────────────────┐
+   │     │  GeoIndex  │    │ Pricing /Surge │
+   │     │  (Redis    │    │ Service        │
+   │     │  Geo / S2) │    └────────────────┘
+   │     └────────────┘
+   │
+   ▼
+┌────────────────────────┐
+│  Trip DB (Cassandra)   │
+│  Postgres for payments │
+└────────────────────────┘
+        │
+        ▼
+   ┌──────────────┐
+   │ Payment Svc  │ → Stripe / Adyen
+   └──────────────┘
+\`\`\`
+
+## Database Schema
+\`\`\`
+trips (Cassandra, partition: trip_id)
+  trip_id, rider_id, driver_id, status, pickup_loc, dropoff_loc,
+  fare_estimated, fare_final, started_at, ended_at, route_polyline
+
+drivers (Postgres + Redis cache)
+  driver_id, status (offline|online|on_trip), vehicle_id, rating, current_loc
+
+driver_locations (Redis) — geo index
+  GEOADD locations:cell_{cellId} <lng> <lat> driver_{id}
+  TTL 30 sec; auto-evicts stale drivers
+
+trip_history_by_user (Cassandra, partition: rider_id)
+  rider_id, trip_id, completed_at  (for fast user history queries)
+
+payments (Postgres, ACID required)
+  payment_id, trip_id, amount, status, provider_ref
+\`\`\`
+
+## Detailed Component Design
+
+**Geospatial indexing — the core hard problem**:
+- 5M drivers, position every 4 sec → 1.25M writes/sec
+- Need to query "drivers within 2km of (lat, lng)" in milliseconds
+
+**Solution: Quad-tree / S2 cells / H3 hexagons + Redis Geo**:
+- Divide world into hierarchical cells (e.g., S2 cells at level 12 ≈ 1 km²)
+- Each driver's location maps to a cell ID
+- Redis sorted sets per cell: \`SADD drivers:cell_xyz driver_id\`
+- Driver-update is O(1): remove from old cell, add to new cell
+- Match query: identify rider's cell + 8 neighbors → SUNION → get nearby drivers
+
+**Matching algorithm**:
+1. Rider requests ride at location L
+2. Identify candidate drivers within radius (e.g., 5 km, expanding if no match)
+3. For each candidate, compute ETA via routing service (real road network, not Euclidean)
+4. Score = function(ETA, driver rating, vehicle match, surge eligibility)
+5. Send offer to top driver; 15-second timeout; if rejected/timeout → next driver
+6. Once accepted: lock driver, mark \`on_trip\`, notify rider
+
+**Trip state machine** (strict ordering):
+\`\`\`
+requested → matched → arriving → in_trip → completed → rated
+                ↓
+            cancelled
+\`\`\`
+Transitions enforced server-side; client UI driven by status.
+
+**Surge pricing**:
+- Real-time supply/demand ratio per geographic cell
+- If demand > supply (e.g., concert ending): multiplier kicks in
+- Surge attracts drivers (higher pay) and reduces demand (higher price)
+- Computed every 1 min per cell; smoothed to avoid wild swings
+
+**Payments — strong consistency**:
+- Use Postgres with ACID transactions
+- Idempotency key per payment (trip_id) — retries don't double-charge
+- Two-phase: authorize on trip start, capture on completion
+- Failure handling: retry queue, manual reconciliation dashboard
+
+## Scaling Strategy
+- **Geo-partitioning**: each region (city) has its own matching service instance with local geo index — keeps location traffic local
+- **Driver location pipeline**: TCP/QUIC connections from driver apps to nearest edge server; updates batched and forwarded to regional matching
+- **Trip DB sharded by trip_id**: writes distribute evenly; reads of "my trips" require trip_history_by_user denormalization
+- **Cassandra for trip data**: write-heavy workload, good fit; eventual consistency acceptable for history
+- **Postgres for payments**: must be strongly consistent; not at the same scale as locations
+- **WebSocket for status updates**: instead of polling
+
+## Trade-offs & Bottlenecks
+- **Geo index granularity**: smaller cells = more precision but more cells to query. S2 level 12 (~1km²) is a sweet spot.
+- **Match latency vs match quality**: spend more time finding the optimal driver vs assigning quickly. Target ~3 sec total.
+- **Driver app updates**: 1.25M writes/sec into Redis. Must shard Redis by cell prefix to scale.
+- **Bottleneck**: matching service hot spots — popular areas (downtown SF) have heavy load. Solve via cell subdivision and dedicated worker pools.
+- **Pricing fairness vs revenue**: surge maximizes revenue but creates user resentment. Cap surge multipliers; communicate clearly.
+
+## Follow-up Questions
+1. **What if a driver loses connectivity mid-trip?** Client buffers location updates locally; batches on reconnect. Server treats stale data with ETA penalty.
+2. **How do you prevent driver-rider collusion (fake trips)?** ML on trip patterns: distance/duration anomalies, repeated pairs, GPS spoofing detection. Manual review for flagged cases.
+3. **How does ETA prediction work?** Historical road speeds + real-time traffic + ML models on time-of-day/weather. Continuously updated as drivers move.
+4. **How to handle 1M new users at IPO/major event?** Auto-scale stateless services. Pre-provision regional matching. Surge price absorbs short-term demand.
+5. **Pool / shared rides architecture?** Online optimization problem: combining 2+ riders on a route. Adds matching latency; ML predicts likelihood of finding a poolable rider.
+6. **How are cross-region trips handled (e.g., airport drop-off)?** Trip lifecycle owned by origin region; handed off with metadata if needed. Data eventually replicated.
+7. **What about rider safety (SOS button)?** Dedicated incident service; escalates to live operators; shares trip data with emergency contacts. Latency-critical, high-availability.`,
+
+  'Design Rate Limiter': `## Functional Requirements
+- Limit requests per client (user/IP/API key) over a time window
+- Return 429 Too Many Requests when limit exceeded
+- Configurable rules per route (e.g., login: 5/min, search: 100/min)
+- Distributed: works across multiple API servers consistently
+- Low latency: must add < 5ms to each request
+
+## Non-Functional Requirements
+- **Scale**: 1M req/sec across the API fleet
+- **Latency**: < 5ms decision time (p99)
+- **Accuracy**: small overcount tolerable (< 1%)
+- **Availability**: rate limiter failure must not break the API → fail-open or fail-closed policy decided per route
+
+## Capacity Estimation
+\`\`\`
+Decisions/sec:    1M  (one per request)
+Counters needed:  ~10M unique keys (user × route combinations)
+Storage:          ~100 bytes/counter × 10M = 1 GB → fits in Redis
+\`\`\`
+
+## API / Integration Design
+**Used as a middleware**, not a public API:
+\`\`\`
+Request comes in → middleware extracts client identity (user_id / IP / API key)
+                → calls RateLimiter.allow(key, limit, window)
+                → returns true/false
+                → if false: respond 429 with Retry-After header
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+       Request
+          │
+          ▼
+   ┌─────────────┐
+   │  API Server │
+   │ + Rate      │
+   │   Limiter   │ ────► Redis cluster (counters)
+   │   Middleware│
+   └─────────────┘
+          │
+          ▼
+   ┌─────────────┐
+   │  App Logic  │
+   └─────────────┘
+\`\`\`
+
+## Algorithms — Core of the Design
+
+| Algorithm | How it works | Pros | Cons |
+|---|---|---|---|
+| **Fixed window counter** | Counter per (key, time-window). Increment, compare to limit. | Simple, fast, low storage | Burst at window boundary (2x limit briefly) |
+| **Sliding window log** | Store timestamp of every request; count those in last N seconds | Exact | Memory-heavy at scale |
+| **Sliding window counter** | Weighted average of current + previous window | Smooth, low memory | Approximate (slight overcount) |
+| **Token bucket** | Tokens refill at rate R; each request consumes 1; reject if empty | Allows bursts up to bucket size | Per-key state |
+| **Leaky bucket** | Queue with fixed drain rate; drop overflow | Smooth output rate | Adds latency (queueing) |
+
+**Recommended: Sliding window counter or Token bucket.**
+
+## Detailed Implementation — Redis Token Bucket
+\`\`\`
+KEY = "rl:user_123:login"
+fields: tokens, last_refill_ts
+
+Algorithm (atomic via Lua script):
+  now = current_time_ms
+  state = HGETALL key
+  if state empty: tokens = capacity, last_refill = now
+  else:
+    elapsed = now - last_refill
+    tokens = min(capacity, tokens + elapsed * (capacity / window_ms))
+    last_refill = now
+  if tokens >= 1:
+    tokens -= 1
+    HSET key tokens=tokens last_refill=last_refill
+    EXPIRE key window_seconds * 2
+    return ALLOW
+  else:
+    return DENY
+\`\`\`
+The Lua script ensures the read-modify-write is atomic. ~0.5ms per call to a local Redis.
+
+## Detailed Implementation — Sliding Window Counter (Redis sorted set)
+\`\`\`
+KEY = "rl:user_123:api"
+ZADD key now now              ; record this request
+ZREMRANGEBYSCORE key 0 (now - window_ms)   ; clean old
+ZCARD key                     ; count requests in window
+\`\`\`
+Memory cost: O(N) per key. Use only for low-volume routes.
+
+## Distributed Consistency
+**Single Redis is the simplest consistent solution.** All API servers write to the same Redis. Bottleneck = Redis throughput (~100K ops/sec per node).
+
+For higher scale:
+- **Redis Cluster** with consistent hashing on \`key\` → spreads load
+- **Sharded by key**: same key always hits same node → counters consistent
+- **Replicated counters** (less accurate): each region has local counter, sync deltas async — accepts overcount during partition
+
+## Failure Handling
+**Fail-open vs fail-closed**:
+- **Login route → fail-closed**: if Redis is down, reject (don't risk credential stuffing). Better to outage than security hole.
+- **Read APIs → fail-open**: if Redis is down, allow. Better to serve stale data than to error.
+
+## Scaling Strategy
+- **Local cache + bulk sync**: each API server keeps a local count; flushes to Redis every 1 sec
+- **Tiered limits**: per-IP (anti-DDoS) at edge, per-user (anti-abuse) at app, per-account (billing) at gateway
+- **CDN-level rate limiting**: Cloudflare/Fastly enforce IP limits before traffic hits origin
+
+## Trade-offs & Bottlenecks
+- **Accuracy vs cost**: exact (sliding log) is expensive; approximate (sliding window) is cheap. 1% slop is fine.
+- **Per-route storage**: 10M users × 50 routes = 500M counters. Use TTLs aggressively.
+- **Hot-key problem**: popular API key → single Redis node hot. Solution: client-side splitting (10 sub-keys per key, sum on read) or local pre-aggregation.
+- **Bottleneck**: Redis throughput. Lua scripts help (one round-trip per decision instead of multiple).
+
+## Follow-up Questions
+1. **How do you communicate the limit to clients?** Response headers: \`X-RateLimit-Limit\`, \`X-RateLimit-Remaining\`, \`X-RateLimit-Reset\`, \`Retry-After\` on 429.
+2. **What if you need different limits for different user tiers?** Lookup user's plan; pass tier-specific limit to rate limiter. Cache plan info in Redis to avoid DB hit.
+3. **How would you rate-limit by request size (not just count)?** "Cost" rate limiter: each request has a cost (e.g., bytes / DB queries / GPU seconds). Token bucket with variable consumption.
+4. **How to prevent rate-limit bypass via multiple IPs?** Combine identifiers: IP + cookie + fingerprint. Apply tightest matching limit. Detect distributed abuse via ML on traffic patterns.
+5. **What if Redis cluster has split-brain?** Token bucket is approximate anyway; some overcount is OK. For strict needs, use a CP system (etcd/Zookeeper) — slower but consistent.
+6. **How does Stripe/Cloudflare do it?** Cloudflare uses sliding window counter at edge with eventual consistency across PoPs. Stripe uses leaky bucket per API key. Both prioritize edge enforcement.`,
+
+  'Design API Gateway': `## Functional Requirements
+- Single entry point for all API traffic; routes to backend microservices
+- Authentication & authorization (validates JWT/API keys)
+- Rate limiting and throttling
+- Request/response transformation (e.g., JSON ↔ gRPC)
+- Caching of cacheable responses
+- Logging, metrics, distributed tracing
+- A/B testing, canary routing
+- WAF (Web Application Firewall) integration
+
+## Non-Functional Requirements
+- **Scale**: 1M req/sec across the API surface
+- **Latency**: < 10ms gateway overhead
+- **Availability**: 99.99%+ (every API depends on it)
+- **Security**: TLS termination, request validation, anti-DDoS
+- **Stateless**: horizontal scaling via more instances
+
+## Capacity Estimation
+\`\`\`
+Throughput:    1M req/sec
+Per instance:  ~30K req/sec realistic
+Instances:     ~50 (with headroom)
+Bandwidth:     1M × avg 5KB request + 50KB response = 55 GB/sec
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+        Client
+          │
+          ▼
+    ┌──────────┐
+    │   DNS    │
+    └─────┬────┘
+          │
+    ┌─────▼──────┐
+    │    L4 LB   │  (network LB / ELB)
+    └─────┬──────┘
+          │
+   ┌──────┴───────┐
+   ▼              ▼
+┌───────┐     ┌───────┐
+│Gateway│ ... │Gateway│  (50 instances)
+│Pod 1  │     │Pod N  │
+└───┬───┘     └───┬───┘
+    │             │
+    │   ┌─────────▼──────────┐
+    │   │ Service Discovery  │  (Consul/Eureka)
+    │   └────────────────────┘
+    │
+    │   ┌────────┬─────────┬────────┐
+    └──►│ Auth   │ Search  │ Order  │ ... microservices
+        │Service │ Service │ Service│
+        └────────┴─────────┴────────┘
+\`\`\`
+
+## Core Pipeline (per request)
+\`\`\`
+1.  TLS termination
+2.  Parse + sanitize HTTP
+3.  WAF rules (block obvious attacks)
+4.  Authentication (JWT verify or API key lookup)
+5.  Authorization (RBAC / ABAC)
+6.  Rate limit check (Redis)
+7.  Request transformation (e.g., add internal headers)
+8.  Route lookup (path → upstream service)
+9.  Circuit breaker check (skip if upstream unhealthy)
+10. Forward to upstream (HTTP/gRPC)
+11. Response transformation
+12. Cache write (if applicable)
+13. Metrics + tracing emission
+14. Return to client
+\`\`\`
+
+## Routing & Configuration
+\`\`\`yaml
+routes:
+  - path: /api/users/**
+    upstream: user-service
+    timeout: 2s
+    auth: required
+    rate_limit: 100/min/user
+  
+  - path: /api/search
+    upstream: search-service
+    cache: 30s
+    transform:
+      strip_headers: [X-Internal-*]
+\`\`\`
+Config stored in a control plane (etcd/Consul). Gateway watches for changes and reloads without dropping connections.
+
+## Detailed Component Design
+
+**Authentication caching**:
+- JWT validation requires public key — cache JWKS keys for 1h
+- Don't hit auth service per request; verify locally
+- For opaque API keys: lookup once, cache decision in local LRU for 60s
+
+**Circuit breaker** (Hystrix/Resilience4j pattern):
+- Track upstream success rate over rolling window
+- If error rate > 50% → open circuit; fail fast for 30s
+- Half-open → let some traffic through to test recovery
+
+**Connection pooling to upstreams**:
+- Persistent HTTP/2 connections (multiplexed)
+- Pool of e.g., 100 conns per upstream per gateway instance
+- Saves TCP+TLS handshake on every request
+
+**Caching**:
+- Cacheable: GET, no auth-specific data, with cache-control hint
+- Cache key: method + path + query + relevant headers (e.g., Accept-Language)
+- Storage: in-memory LRU on each gateway instance (1GB) + shared Redis layer (10GB)
+- Cache invalidation: TTL-based (simple) or event-driven (precise but complex)
+
+**Distributed tracing**:
+- Inject \`X-Request-ID\` header at gateway
+- Propagate across all downstream calls
+- OpenTelemetry: spans emitted to Jaeger/Tempo
+
+## Scaling Strategy
+- **Stateless instances** behind L4 LB → horizontal scale
+- **Hot config** loaded into memory; reloaded on change events
+- **Connection pools sized for upstream capacity** — don't overwhelm slow services
+- **Multi-region**: gateway deployed per region; client routed to nearest via Anycast / GeoDNS
+- **Graceful degradation**: if rate limiter Redis is down, fall back to in-memory counters per instance (less accurate but functional)
+
+## Trade-offs & Bottlenecks
+- **Single point of failure** mitigated by redundancy + multi-region. Still: gateway bug → API outage. Test thoroughly.
+- **Latency overhead**: each feature adds ~1ms (auth, rate limit, transform). Don't add features carelessly.
+- **State complexity**: caches, rate limit counters, circuit breaker stats — all add memory pressure. Tune carefully.
+- **Bottleneck**: TLS termination is CPU-heavy. Use modern AES-NI hardware; consider offloading to LB.
+- **Versioning**: backward-compat is hard. Multi-version routing (\`/v1\`, \`/v2\`) lets services migrate independently.
+
+## Follow-up Questions
+1. **Why have a gateway instead of direct service-to-service?** Cross-cutting concerns (auth, rate limit, monitoring) centralized; clients see one URL; backend services stay simple.
+2. **Service mesh vs API gateway?** Mesh = internal east-west traffic (Istio). Gateway = north-south (external). Often coexist.
+3. **How to migrate a service behind the gateway?** Deploy new service in parallel, route 1% traffic via gateway config, monitor errors, ramp up.
+4. **What's the canary deploy pattern here?** Tag 5% of traffic with experiment header; route to canary upstream. Compare error rates and latency before full rollout.
+5. **How would you implement WebSocket support?** Long-lived connections complicate gateway state. Use protocol-aware LB; route by sticky session; can't easily transform mid-stream.
+6. **Auth cache invalidation when user is banned?** Push event to gateway from auth service via Pub/Sub; flush specific user's cache entry.
+7. **Kong / Envoy / NGINX — which to use?** Envoy for high-traffic + gRPC. Kong for plugin ecosystem. NGINX for simplicity. AWS API Gateway for managed solution.`,
+
+  'Design CDN': `## Functional Requirements
+- Cache and serve static content (images, JS, CSS, video) from edge nodes near users
+- Cache invalidation API
+- Origin pull (lazy loading from origin) and push (pre-warming)
+- TLS termination at edge
+- Geographic routing of requests
+- Analytics: hit ratio, bandwidth, geo distribution
+
+## Non-Functional Requirements
+- **Scale**: 100 Tbps peak globally; tens of millions of req/sec
+- **Latency**: < 50ms TTFB anywhere in the world
+- **Availability**: 99.99%+ — outages are very public
+- **Cost**: bandwidth dominates; minimize origin egress
+- **Cache hit ratio**: > 90% target; > 99% for popular content
+
+## Architecture Overview
+\`\`\`
+Client (anywhere)
+   │
+   │ DNS resolves to nearest PoP via Anycast or GeoDNS
+   ▼
+┌──────────────────────────────────┐
+│       Edge PoP (Point of         │
+│       Presence) — 200+ globally  │
+│  ┌──────────────────────────┐    │
+│  │ L4 LB → Edge Server      │    │
+│  │  - TLS terminate         │    │
+│  │  - Local cache (SSD/RAM) │    │
+│  └──────────────────────────┘    │
+└──────────┬───────────────────────┘
+           │ cache miss
+           ▼
+┌──────────────────────────────────┐
+│   Regional Cache Tier            │
+│   (mid-tier, 10 regions)         │
+└──────────┬───────────────────────┘
+           │ cache miss
+           ▼
+┌──────────────────────────────────┐
+│         Origin Shield             │
+│   (single per region; protects   │
+│    origin from thundering herd)  │
+└──────────┬───────────────────────┘
+           │
+           ▼
+       Origin Server
+       (customer's S3/web server)
+\`\`\`
+
+## How a Request Flows
+1. Client DNS query for \`cdn.example.com\` → Anycast IP advertised by all PoPs
+2. BGP routes the packet to nearest PoP (network distance, not always geographic)
+3. Edge server checks local cache:
+   - **Hit** → respond from RAM/SSD (~5ms)
+   - **Miss** → request to regional tier
+   - Regional miss → origin shield
+   - Shield miss → origin pull
+4. Response cached at every tier on the way back
+5. Client receives bytes; metrics flushed async
+
+## Cache Hierarchy — Why Multiple Tiers?
+- **Edge** (200+ PoPs): smallest caches, closest to user; very high churn
+- **Regional** (10s): bigger, longer retention; absorbs misses from many edges
+- **Origin Shield** (1 per region): single point that fetches from origin; deduplicates simultaneous requests for same content
+
+A 1-tier CDN would hammer origin with N misses for the same content during a viral spike. Multi-tier cuts origin requests to ~1/N.
+
+## Cache Storage
+- **RAM tier** (~100GB per server): hottest objects, < 1ms access
+- **SSD tier** (~10TB per server): warm objects, ~5ms
+- **Eviction**: LRU or 2Q; size-aware (keep small popular files preferentially)
+
+## Routing — How Clients Find the Nearest PoP
+Two approaches:
+
+| | Anycast | GeoDNS |
+|---|---|---|
+| How | Same IP advertised globally; BGP routes to nearest | DNS returns different IPs based on resolver location |
+| Pros | Auto-failover (network re-routes); no DNS config | Better for video (sticky to a server); finer control |
+| Cons | TCP can break if BGP changes mid-conn (rare) | Resolver geography != user geography (mobile, VPN) |
+
+**Most CDNs use both**: Anycast for IP routing, GeoDNS for fine-tuning.
+
+## Cache Invalidation — Hard Problem
+Content can change. CDN must propagate "invalidate /image.jpg" to 200 PoPs.
+- **Approach 1: TTL** (simplest) — content expires automatically
+- **Approach 2: Versioned URLs** (\`/image.v2.jpg\`) — never invalidate; just deploy new URL
+- **Approach 3: Purge API** — push invalidation to PoPs via control plane (~30 sec to global)
+
+Versioned URLs is the gold standard. Cache TTL can be a year.
+
+## Origin Shield Logic
+On miss, the shield checks: "Is this URL already being fetched?"
+- **Yes** → wait for the in-flight fetch (request coalescing)
+- **No** → fetch from origin, populate cache, fan out to waiting requests
+
+This single optimization can reduce origin load by 100x during a flash crowd.
+
+## Scaling Strategy
+- **PoP capacity**: Tier 1 (NYC, London, Tokyo, etc.) provisioned for 10 Tbps each
+- **Software**: NGINX/Varnish/custom (Cloudflare uses their own); kernel bypass (DPDK/XDP) for line-rate processing
+- **DDoS absorption**: edge has huge capacity; absorbs attacks before they reach origin
+- **Network**: peering agreements with ISPs; private backbone between PoPs to bypass public internet
+
+## Trade-offs & Bottlenecks
+- **Cache hit ratio is everything**: every miss hits paid origin bandwidth. Tune TTLs, normalize URLs (sort query params), strip cache-busting headers.
+- **Invalidation latency**: minutes for global purge. Plan for it.
+- **Cost vs latency**: more PoPs = lower latency but higher cost. Tier 2 markets get fewer PoPs.
+- **TLS overhead**: certificate management for thousands of customer domains is a real engineering challenge (SNI, automated cert provisioning).
+- **Bottleneck**: origin pull bandwidth. Always have origin shield + request coalescing.
+
+## Follow-up Questions
+1. **How do you cache personalized content?** "Edge Side Includes" (ESI): cache the static parts, fetch personalized fragments from origin. Or, vary cache by user segment (logged-in vs anonymous) — coarse but practical.
+2. **How do you handle dynamic content (HTML)?** Short TTL (10s-60s) gives "good enough" caching. Or full origin pass-through for non-cacheable.
+3. **Why doesn't Netflix use commercial CDNs?** Cost. Netflix peering with ISPs via Open Connect bypasses commercial CDNs entirely.
+4. **What about video streaming?** Same architecture; range requests cached per byte range; manifests cached short, segments cached long.
+5. **How does Cloudflare's Workers / edge compute fit in?** JS/WASM runtime at every PoP. Run code at edge instead of origin. Same model; more compute capability.
+6. **Detecting and mitigating DDoS?** Anomaly detection per IP/ASN; challenge with CAPTCHA; absorb at edge with massive capacity. SYN cookies for SYN floods.
+7. **What's "Origin Pull" vs "Origin Push"?** Pull = lazy load on first miss (default). Push = preload before users request (used for new product launches; warms the cache).`,
+
+  'Design Distributed Cache': `## Functional Requirements
+- Get/Set/Delete by key with low latency
+- Optional TTL for auto-expiry
+- High availability (no single point of failure)
+- Horizontally scalable (add nodes without downtime)
+- Cache-aside / read-through / write-through patterns supported by clients
+- Eviction when memory full
+
+## Non-Functional Requirements
+- **Scale**: 10TB total, 10M ops/sec
+- **Latency**: < 1ms p99 for in-region access
+- **Availability**: 99.99%; tolerate single node failures
+- **Consistency**: eventual is acceptable (it's a cache)
+- **Durability**: not required (cache loss → re-fetch from source)
+
+## Capacity Estimation
+\`\`\`
+Total data:    10 TB
+Per node:      64 GB RAM × 200 nodes = 12.8 TB raw → 10 TB usable after replication
+Throughput:    10M ops/sec / 200 nodes = 50K ops/sec per node (Redis can do this)
+Network:       100 Gbps internal backbone for replication and rebalancing
+\`\`\`
+
+## Architecture
+\`\`\`
+Application Servers
+       │
+       ▼
+┌──────────────┐
+│ Smart Client │ ← knows topology; hashes key → node
+│ (Jedis/lettuce)│
+└──────┬───────┘
+       │
+   ┌───┼─────────────────────┐
+   ▼   ▼                     ▼
+┌──────┐ ┌──────┐  ...  ┌──────┐
+│ Node │ │ Node │       │ Node │
+│  1   │ │  2   │       │  N   │
+│primary│ │primary│      │primary│
+│  +   │ │  +   │       │  +   │
+│replica│ │replica│      │replica│
+└──────┘ └──────┘       └──────┘
+       │                     │
+       ▼                     ▼
+  ┌───────────────────────────┐
+  │   Cluster Coordinator     │ (gossip / Zookeeper)
+  │  - membership             │
+  │  - failure detection      │
+  │  - rebalancing            │
+  └───────────────────────────┘
+\`\`\`
+
+## Core Algorithm — Consistent Hashing
+**Why?** With N nodes, hash(key) % N maps keys to nodes. But adding/removing a node moves nearly ALL keys → cache stampede.
+
+**Consistent hashing**:
+- Hash function maps both keys AND nodes onto a circular ring (0 to 2^32)
+- A key belongs to the first node clockwise from its hash position
+- Adding a node only steals keys from its immediate neighbor (~1/N of keys move)
+
+**Virtual nodes (vnodes)**: each physical node represented by 100-1000 hash positions on the ring. Smooths out distribution; faster rebalancing.
+
+## Detailed Component Design
+
+**Replication for HA**:
+- Each key replicated to N nodes (typically 2-3, primary + replicas)
+- Primary handles writes; async replicates to replicas
+- On primary failure: failover to replica; promote to primary
+
+**Failure detection**:
+- Gossip protocol: nodes exchange heartbeats with peers
+- Suspect → confirm → fail transitions to avoid flapping
+- Coordinator (or quorum) decides reassignment
+
+**Rebalancing on node add**:
+1. New node registers with coordinator
+2. Coordinator computes new hash ring assignment
+3. Affected nodes start streaming keys to new node
+4. Once complete, traffic routes to new node
+5. Old replicas can drop the moved keys
+
+**Eviction policies**:
+- **LRU** — most common; simple, effective for general workloads
+- **LFU** — better when access frequency matters more than recency
+- **TTL-based** — evict expired first, then LRU
+- **Allkeys-LRU vs Volatile-LRU** — evict any key vs only TTL'd keys
+
+## Client-Side Logic
+- **Smart client** holds a topology snapshot (ring) refreshed periodically
+- For \`GET key\`: hash key → identify primary node → connect (pooled) → request
+- On error/timeout: try replica; mark node suspect; refresh topology
+- Connection pool per node; pipelined requests for throughput
+
+## Read/Write Patterns
+| Pattern | Read | Write |
+|---|---|---|
+| **Cache-aside** | App reads cache first, falls back to DB on miss; populates cache | App writes DB; invalidates cache key |
+| **Read-through** | App reads cache; cache fetches from DB on miss transparently | (varies) |
+| **Write-through** | (cache-aside) | App writes cache; cache writes DB synchronously |
+| **Write-back** | (cache-aside) | App writes cache; cache writes DB async (risk: data loss on cache crash) |
+
+Cache-aside is the most common pattern in practice.
+
+## Scaling Strategy
+- **Horizontal scale-out**: add nodes; consistent hashing rebalances ~1/N of keys
+- **Replication factor 2-3**: tolerates single-node failures without data loss for the cache window
+- **Multi-region**: separate clusters per region; cross-region replication async (write conflicts resolved last-write-wins)
+- **Connection multiplexing**: clients reuse connections; pipelining batches multiple commands
+
+## Trade-offs & Bottlenecks
+- **Memory cost**: RAM is expensive vs disk. Use compression, smaller key/value formats (msgpack), evict aggressively.
+- **Hot keys**: a single popular key overwhelms one node. Solutions:
+  - Read replicas (multiple nodes hold the same key)
+  - Client-side caching (LRU at app level)
+  - Key splitting (\`key:1\`, \`key:2\` etc., random selection)
+- **Network partition**: nodes in different sides of partition both think they're primary → split brain. Use quorum to elect primary; consistency favors availability (AP system).
+- **Bottleneck**: cluster rebalancing time. Adding a node is O(data moved). For 10TB, can take hours. Plan ahead, don't add nodes during peak.
+
+## Follow-up Questions
+1. **How does Redis Cluster compare to Memcached?** Redis: rich data types, persistence, replication built-in. Memcached: simpler, multi-threaded, lower memory overhead per key. Redis wins for most use cases today.
+2. **What if a node returns stale data after partition?** Last-write-wins via timestamps; or use version vectors for conflict-free replicated data types (CRDTs).
+3. **Cache stampede prevention?** "Lease" pattern: first miss → acquire lease, fetch from DB, populate; concurrent misses see lease, wait for fill. Or probabilistic early refresh.
+4. **What's the "thundering herd" problem?** Cache expires for popular item → 1000 servers simultaneously hit DB. Solutions: stale-while-revalidate, request coalescing.
+5. **How would you support cache warm-up after deploy?** Replay recent traffic against cluster; or copy keys from old cluster.
+6. **DRAM vs SSD-backed cache?** SSD (e.g., dragonfly, redis on SSD): cheaper per GB, lower throughput. Hybrid: hot in RAM, warm on SSD.
+7. **How would you support transactions across keys?** Don't — cache is for speed. If you need multi-key atomicity, use a database. Or single-key Lua script in Redis.`,
+
+  'Design Load Balancer': `## Functional Requirements
+- Distribute incoming requests across N backend servers
+- Health checks; remove unhealthy backends from rotation
+- Multiple algorithms (round-robin, least-conn, weighted, consistent hash)
+- Sticky sessions (optional)
+- TLS termination
+- Layer 4 (TCP) and Layer 7 (HTTP) operation
+
+## Non-Functional Requirements
+- **Throughput**: line-rate processing — 10s of Gbps
+- **Latency**: < 1ms added latency
+- **Availability**: 99.99%+ — its failure breaks everything behind it
+- **Concurrency**: hundreds of thousands of concurrent connections
+- **Stateless** at L4; minimal state at L7 (sessions optional)
+
+## Architecture
+\`\`\`
+       Internet
+          │
+          ▼
+   ┌──────────┐
+   │   DNS    │  → multiple LB IPs (DNS round robin / Anycast)
+   └─────┬────┘
+         │
+   ┌─────▼──────┐    ┌─────────────┐
+   │   LB #1    │ ───│ LB #2 (HA)  │  active-active or active-passive
+   │            │    │             │
+   │  - health  │    │ - VRRP/keep │
+   │  - dispatch│    │   alived    │
+   └─────┬──────┘    └─────────────┘
+         │
+    ┌────┼────┬─────┬──────┐
+    ▼    ▼    ▼     ▼      ▼
+  ┌────┐┌────┐┌────┐┌────┐┌────┐
+  │BE 1││BE 2││BE 3││BE 4││BE 5│
+  └────┘└────┘└────┘└────┘└────┘
+\`\`\`
+
+## L4 vs L7 Load Balancing
+
+| | L4 (TCP/UDP) | L7 (HTTP/HTTPS) |
+|---|---|---|
+| Layer | Transport | Application |
+| Decisions on | IP, port | URL path, headers, cookies |
+| Examples | AWS NLB, HAProxy in TCP mode | NGINX, Envoy, ALB |
+| Throughput | Higher (less work per packet) | Lower |
+| Features | Simple | Path routing, header rewriting, TLS, caching |
+| TLS | Pass-through (server terminates) | LB terminates |
+
+**L4** is faster but blind to content. **L7** is smarter but slower.
+
+## Algorithms
+
+| Algorithm | How | Use case |
+|---|---|---|
+| **Round Robin** | Rotate through backends | Equal-capacity backends, stateless |
+| **Weighted RR** | Different weights per backend | Mixed-capacity (e.g., bigger boxes get more) |
+| **Least Connections** | Pick backend with fewest active | Long-lived connections; uneven request durations |
+| **Least Response Time** | Pick backend with lowest avg latency | Sensitive to slow backends |
+| **IP Hash** | Hash client IP → backend | Crude session affinity |
+| **Consistent Hash** | Hash key (e.g., user ID) → backend with stable mapping | Cache-aware load balancing |
+| **Random + Two Choices** | Pick 2 random; choose less loaded | Surprisingly close to least-conn, no global state |
+
+**Power of Two Choices** is underrated — simple to implement, provably good distribution.
+
+## Health Checks
+- **Active**: LB periodically pings backend (HTTP /health, TCP connect)
+- **Passive**: track success/failure of real traffic; mark unhealthy on consecutive failures
+- **Both** in production: active for definite signal, passive for fast detection
+
+Health check considerations:
+- Interval (e.g., 5s)
+- Timeout (e.g., 2s)
+- Threshold (3 consecutive failures = mark down)
+- Slow start: ramp traffic to newly-healthy backend gradually (don't dump full load instantly)
+
+## TLS Termination
+- Decrypt at LB → forward plaintext (or re-encrypt) to backend
+- Saves backend CPU; centralizes cert management
+- For end-to-end encryption: re-encrypt to backend with internal certs
+- Modern: TLS 1.3 + AES-NI hardware → minimal overhead
+
+## Connection Handling
+- Persistent client → LB connections (HTTP/2 multiplexed)
+- Pool of LB → backend connections (reused across clients)
+- This is critical: don't open a new TCP connection per request
+
+## Sticky Sessions
+- Cookie-based: LB sets cookie pinning client to a backend
+- IP-based: hash IP → backend (breaks for NAT'd clients)
+- **Avoid if possible** — breaks horizontal scaling, complicates failover. Better: store session in shared store (Redis), backends are stateless.
+
+## High Availability of the LB Itself
+- **Active-passive**: VRRP / keepalived. Floating IP fails over to standby.
+- **Active-active**: DNS or Anycast routes traffic to multiple LB instances.
+- **Cloud LBs (ELB/ALB)** abstract this — multiple LB nodes auto-managed.
+
+## Scaling Strategy
+- **L4 LB scales easily**: stateless, fast packet forwarding. Hardware (F5) or software (NGINX/HAProxy) at line rate.
+- **L7 scales out**: more instances behind a network LB. State (sticky sessions) externalized to Redis.
+- **Anycast IP** for global LB: same IP advertised from multiple PoPs; routed via BGP.
+- **DSR (Direct Server Return)**: response bypasses LB, goes directly to client. Saves LB bandwidth massively for download-heavy workloads.
+
+## Trade-offs & Bottlenecks
+- **Single point of failure**: must have HA. Test failover regularly.
+- **Latency vs features**: every L7 feature (routing, transformation) adds ms. Minimize.
+- **Connection limits**: each LB has open file descriptor limits; tune kernel (somaxconn, file-max).
+- **Bottleneck**: TLS termination CPU. Use modern hardware; offload if possible.
+- **Cost**: cloud LBs charge per LCU (load balancer capacity unit). Heavy traffic can be expensive.
+
+## Follow-up Questions
+1. **What about WebSocket/gRPC?** Long-lived connections complicate balancing. Use connection counts, not request counts. L7 LB needs HTTP/2 + WebSocket support.
+2. **Why have multiple LB tiers (edge LB → app LB)?** Different functions: edge for TLS + DDoS, app LB for path routing. Also: edge LB across regions, app LB within.
+3. **How does AWS ELB scale?** ELB is itself a fleet of nodes auto-managed by AWS. NLB at L4 (very high throughput); ALB at L7 (richer features); CLB (legacy).
+4. **What's an internal load balancer?** Not internet-facing; balances east-west traffic (microservice → microservice). Common in Kubernetes (kube-proxy / service mesh).
+5. **How does client-side LB compare?** Library on client picks backend (e.g., Ribbon, Finagle). No central LB hop = lower latency. Used in service meshes.
+6. **Global Server Load Balancing (GSLB)?** DNS-level + health-aware routing across regions. AWS Route 53 latency-based routing is an example.
+7. **How would you handle a slowloris attack?** Connection limits per IP; aggressive idle timeout; kernel-level mitigations (SYN cookies). Edge LB / WAF helps.`,
+
+  'Design Distributed Lock': `## Functional Requirements
+- Acquire / release a named lock across distributed clients
+- Mutual exclusion: only one holder at a time
+- Auto-release if holder crashes (no permanent lock)
+- Optional fairness (FIFO order)
+- Optional read-write locks
+
+## Non-Functional Requirements
+- **Correctness**: never grant the lock to two clients simultaneously
+- **Liveness**: lock must eventually release; no permanent holds
+- **Latency**: acquire < 10ms in the common case
+- **Fault tolerance**: lock service failure must be detected; client must release safely
+
+## Why Distributed Locks Are Hard
+A standard mutex doesn't work — there's no shared memory between machines. Network failures, slow GCs, clock drift all conspire to break naive implementations. **Distributed consensus is required for correctness.**
+
+## Approaches
+
+### Approach 1: Redis SETNX (the wrong one most people start with)
+\`\`\`
+SET lock:foo client_123 NX EX 30   ; set if not exists, 30s TTL
+\`\`\`
+**Looks fine. Has subtle bug**:
+- Client A acquires lock with TTL=30s
+- Client A's process freezes (GC pause / scheduler delay) for 35s
+- TTL expires; Client B acquires the lock
+- Client A wakes up, thinks it still holds the lock, performs critical section
+- **Two clients in critical section simultaneously** ✗
+
+### Approach 2: Redis with fencing tokens (Martin Kleppmann's recommendation)
+- Each lock acquisition issues a monotonically increasing token
+- Client must include the token when interacting with the protected resource
+- Resource (DB / file system) rejects writes with stale tokens
+
+\`\`\`
+Client A acquires lock, gets token=42
+Client A pauses; lock expires
+Client B acquires lock, gets token=43
+Client A resumes, sends write with token=42 → DB rejects (stale)
+Client B sends write with token=43 → DB accepts
+\`\`\`
+**This is the only correct pattern.** Redis alone cannot guarantee mutual exclusion under all failures.
+
+### Approach 3: Redlock (Redis multi-master)
+- Acquire lock from N=5 Redis nodes; succeed if majority (3+) ack within timeout
+- Distributes risk; still has subtle issues debated by experts (Kleppmann vs antirez)
+- **Still requires fencing tokens** to be safe
+
+### Approach 4: Zookeeper / etcd (recommended for correctness)
+- Built on Paxos / Raft consensus → strong consistency
+- "Ephemeral nodes": tied to client session; auto-deleted on disconnect
+- Sequential nodes for FIFO fairness
+- Known to be safe; battle-tested (Hadoop, Kafka, Kubernetes use it)
+
+\`\`\`
+Zookeeper recipe:
+  1. Client creates ephemeral sequential node /locks/foo/lock-N
+  2. List children of /locks/foo, sorted by sequence
+  3. If our node is smallest → we hold the lock
+  4. Otherwise: watch the node just before us; wait for delete event
+  5. To release: delete our node (or session expires)
+\`\`\`
+
+## Detailed Design — Zookeeper-based Lock Service
+
+\`\`\`
+       Clients
+         │
+         ▼
+   ┌──────────────┐
+   │ Lock Service │  (stateless API server)
+   └──────┬───────┘
+          │
+   ┌──────▼──────────────┐
+   │  Zookeeper Ensemble │  (3 or 5 nodes, Raft-like consensus)
+   │  /locks/{lock_name}/│
+   └─────────────────────┘
+\`\`\`
+
+**Acquire**:
+1. Create ephemeral sequential znode under \`/locks/foo/\`
+2. List siblings; if ours is lowest sequence → return token
+3. Else watch the predecessor; on delete, retry step 2
+
+**Release**:
+- Delete our znode (or close session, which auto-deletes ephemeral)
+
+**Fencing token**:
+- Use the sequence number as the fencing token
+- Pass to downstream resource for rejection of stale operations
+
+## API Design
+\`\`\`
+POST /api/locks/acquire    { lock_name, ttl_sec, client_id }
+                           → { token, expires_at } or 409 Conflict
+
+POST /api/locks/release    { lock_name, client_id, token }
+
+POST /api/locks/heartbeat  { lock_name, token }   ← extends TTL
+\`\`\`
+
+## Use Cases
+- **Leader election**: only one process performs scheduled work
+- **Cron deduplication**: only one server runs the nightly job
+- **Critical section across services**: e.g., payment refund processing
+- **Resource pool management**: lease a worker from a pool
+
+## Scaling Strategy
+- **Zookeeper ensemble**: 3 or 5 nodes. Quorum = majority. Reads scale with replicas; writes serialize through leader.
+- **Lock service tier**: stateless, scales horizontally. Caches lock state for fast reads. Coordinates with Zookeeper for state changes.
+- **Hot lock**: a heavily contested lock serializes everything. Avoid by partitioning workload (e.g., per-user locks instead of one global lock).
+
+## Trade-offs & Bottlenecks
+- **Latency**: every acquire is a network round-trip + consensus quorum. ~5-20ms typical.
+- **Correctness vs performance**: Redis is fast but unsafe alone. Zookeeper is slow but safe.
+- **Stale clients**: long GC pauses can fool lock services. Always use fencing tokens at the resource.
+- **Bottleneck**: Zookeeper write throughput (~10K writes/sec). Don't use for high-frequency locks.
+- **Operational complexity**: running ZK is non-trivial. Use a managed alternative (etcd, Consul) if possible.
+
+## Follow-up Questions
+1. **What's the Chubby lock service?** Google's distributed lock service, predecessor of Zookeeper. Same model: coarse-grained locks, ephemeral sessions, file-tree namespace.
+2. **Why is "lock with TTL" not enough?** Process pauses (GC, swap, scheduler) can exceed TTL. Without fencing, two clients can be inside the critical section.
+3. **What's the difference between a lock and a lease?** Lease = lock with explicit expiration. The TTL pattern is essentially leases. Same semantic risks.
+4. **When would you NOT use a distributed lock?** When you can use idempotent operations or optimistic concurrency control instead. Distributed locks should be a last resort.
+5. **How does Kubernetes do leader election?** Same pattern: lease object in etcd. Pod with the lease is leader; renews periodically; loses it if it crashes.
+6. **What if Zookeeper is partitioned from the client but client thinks it has the lock?** Client should periodically re-verify with ZK. If ZK unreachable beyond timeout, release lock locally and abort.
+7. **Can two clients hold the same fencing token?** No — by construction, each acquire generates a strictly higher token. The downstream resource only honors the highest-seen token.`,
+
+  'Design Message Queue': `## Functional Requirements
+- Producers publish messages to topics/queues
+- Consumers subscribe and receive messages (one-to-one or one-to-many)
+- Message persistence (survive broker restart)
+- Ordering guarantees (within partition)
+- At-least-once or exactly-once delivery semantics
+- Consumer groups for parallel processing
+- Replay (re-read past messages)
+
+## Non-Functional Requirements
+- **Throughput**: 10M messages/sec across the cluster
+- **Latency**: < 10ms p99 producer-to-consumer
+- **Durability**: replicated; tolerate broker failures
+- **Availability**: 99.99%
+- **Ordering**: per-partition FIFO (Kafka-style) or global FIFO (more expensive)
+- **Retention**: configurable (hours to weeks)
+
+## Capacity Estimation
+\`\`\`
+Throughput:    10M msg/sec × avg 1KB = 10 GB/sec write
+Storage:       7-day retention × 10 GB/sec × 86400 = 6 PB
+Replication 3x: 18 PB total disk
+Brokers:       100 nodes × 100TB SSD each = 10 PB → multi-region
+\`\`\`
+
+## High-Level Architecture (Kafka-style)
+\`\`\`
+Producers
+   │
+   ▼
+┌──────────────────────────────────┐
+│  Broker Cluster (e.g., 100 nodes)│
+│                                   │
+│  Topic: orders                    │
+│  ┌─────────┐ ┌─────────┐ ┌──────┐│
+│  │Partition│ │Partition│ │ ...  ││
+│  │   0     │ │   1     │ │      ││
+│  │ leader  │ │ leader  │ │      ││
+│  │ follower│ │ follower│ │      ││
+│  │ follower│ │ follower│ │      ││
+│  └─────────┘ └─────────┘ └──────┘│
+└──────────────────────────────────┘
+   │
+   ▼
+Consumer Group A: 3 consumers, each reads 1+ partitions
+Consumer Group B: independent offsets
+\`\`\`
+
+## Core Concepts
+
+**Topic** — logical channel (e.g., "orders", "user_events")
+**Partition** — topic split into N partitions for parallelism. Each partition is an ordered, immutable log.
+**Offset** — sequential ID of message within a partition. Consumers track which offset they've read.
+**Consumer Group** — multiple consumers sharing the read load. Each partition assigned to ONE consumer in the group at a time.
+**Leader/Follower** — each partition has a leader (handles read/write) and replicas (followers). Followers replicate from leader.
+
+## Data Structure: The Log
+- Append-only file on disk (one per partition)
+- Indexed by offset for O(log N) random access
+- Sequential writes are very fast on modern SSDs/HDDs (~600 MB/sec)
+- Old segments deleted by retention policy or compaction (key-based)
+
+## Producer Flow
+1. Producer chooses partition (hash of key, or round-robin)
+2. Sends message to partition leader
+3. Leader appends to log, replicates to followers
+4. Once \`acks=all\` quorum acknowledges → success returned to producer
+5. Followers eventually catch up (in-sync replicas — ISR set)
+
+**\`acks\` levels**:
+- \`acks=0\`: fire and forget (lowest latency, possible data loss)
+- \`acks=1\`: leader ack only (data loss if leader crashes before replicas catch up)
+- \`acks=all\`: full quorum (safest, slightly higher latency)
+
+## Consumer Flow
+1. Consumer subscribes to topic
+2. Coordinator assigns partitions across the consumer group
+3. Consumer fetches batches of messages by offset
+4. Processes; commits offset (back to broker or external store)
+5. On crash, another consumer picks up at last committed offset
+
+**Delivery semantics**:
+- **At-most-once**: commit offset before processing → messages may be lost
+- **At-least-once**: process, then commit → duplicates possible (retry on crash)
+- **Exactly-once**: requires idempotent producer + transactional offsets (Kafka EOS) — or downstream idempotency
+
+## Replication & Failover
+- Each partition replicated to N brokers (typically 3)
+- Leader handles all reads/writes; followers replicate
+- ISR (In-Sync Replicas): followers up-to-date with leader (within lag threshold)
+- On leader failure: controller (Zookeeper / KRaft) picks new leader from ISR
+- If \`min.insync.replicas\` not met, producer with \`acks=all\` blocks — preserves correctness over availability
+
+## Scaling Strategy
+- **Add partitions**: more parallelism; consumers can spread load. Caveat: ordering only within partition.
+- **Add brokers**: rebalance partitions across new brokers. Existing topics: move replicas (data heavy).
+- **Tiered storage**: hot segments on SSD (recent data), cold on S3 (older). Confluent Kafka supports this.
+- **Mirror to other clusters**: cross-DC replication for DR (MirrorMaker / Confluent Replicator)
+
+## Detailed Component Design — How Kafka Hits Insane Throughput
+
+1. **Sequential disk I/O**: append-only log → sequential writes. Modern SSDs do 1-3 GB/sec sequential.
+2. **Page cache exploitation**: writes go to OS page cache; consumers read from page cache (often hot data is RAM)
+3. **Zero-copy**: \`sendfile()\` syscall — broker streams from page cache directly to socket, no userspace copy
+4. **Batching**: producer buffers messages, sends in batches (10-100KB)
+5. **Compression**: snappy/lz4/zstd per batch
+6. **Pull-based consumers**: consumer asks for batches at its own pace; broker doesn't push (no slow-consumer problem)
+
+These together yield > 1 GB/sec per broker.
+
+## Trade-offs & Bottlenecks
+- **Ordering vs parallelism**: more partitions = more parallelism but only per-partition ordering. Pick partition key carefully (e.g., user_id keeps user's events ordered).
+- **Replication factor vs throughput**: 3x replication = 3x write bandwidth. Tune by topic importance.
+- **Long-running consumers**: if a consumer holds a partition lease too long without progress, it's seen as dead → rebalance. Heartbeat properly.
+- **Bottleneck**: rebalancing storms when consumers join/leave. Stop-the-world rebalance pauses processing. Newer Kafka has incremental rebalance.
+- **Hot partition**: if partition key isn't well-distributed, one partition gets all traffic. Solution: better hash key, or repartition.
+
+## Follow-up Questions
+1. **Kafka vs RabbitMQ?** Kafka: high throughput, log-based, replay. RabbitMQ: lower latency, work-queue patterns, RPC-style. Different tools for different jobs.
+2. **What's exactly-once semantics?** Producer idempotence (sequence number per producer-partition) + transactional commits across producer + offset. Hard to maintain end-to-end without idempotent consumer.
+3. **How does Kafka handle a slow consumer?** Pull-based, so slow consumer simply lags. As long as it commits offsets, broker keeps messages. Lag monitored via \`consumer_lag\` metric.
+4. **Why partitions matter?** Unit of parallelism + unit of ordering. More partitions = more consumer parallelism, but more rebalancing overhead.
+5. **What if a consumer crashes mid-message?** At-least-once: re-process on restart. Consumer must be idempotent (use message ID for dedup).
+6. **How do you migrate from Kafka v1 to v2?** Rolling upgrade brokers; protocol negotiation handles mixed-version cluster.
+7. **Pulsar vs Kafka?** Pulsar separates compute (brokers) from storage (BookKeeper). Cleaner scaling. Same throughput. Less mature ecosystem.`,
+
+  'Design Key-Value Store': `## Functional Requirements
+- Get / Put / Delete by key
+- High availability (no SPOF)
+- Horizontal scalability
+- Tunable consistency (strong / eventual)
+- Data durability (replication, persistence)
+
+## Non-Functional Requirements
+- **Scale**: 100 TB+, 100K-1M ops/sec
+- **Latency**: < 5ms p99 for in-region access
+- **Availability**: 99.99%+
+- **Durability**: replicated 3x, persistent to disk
+- **Partition tolerance**: must survive network splits (per CAP)
+
+## CAP Choice
+This is a fundamental design decision. Pick TWO of: Consistency, Availability, Partition tolerance.
+- **CP** (Consistency + Partition tolerance): like HBase/Spanner. Reject reads/writes during partition.
+- **AP** (Availability + Partition tolerance): like Cassandra/DynamoDB. Always answer; eventually converge.
+
+Most KV stores choose **AP with tunable consistency** — clients can opt for stronger consistency when needed.
+
+## Architecture Overview (Dynamo-style)
+\`\`\`
+        Client
+          │
+          │ smart client picks coordinator
+          ▼
+   ┌─────────────────┐
+   │  Coordinator    │  (any node can be coordinator)
+   │  (also a node)  │
+   └──────┬──────────┘
+          │
+          │ replicate to N nodes via consistent hashing
+          │
+          ▼
+┌─────────────────────────────────────┐
+│   Ring of Nodes (e.g., 100 nodes)   │
+│                                       │
+│   Each node holds:                   │
+│   - Primary range of keys            │
+│   - Replicas for predecessor ranges  │
+│   - In-memory: memtable + cache      │
+│   - On disk: SSTables + commit log   │
+└─────────────────────────────────────┘
+\`\`\`
+
+## Core Data Structures
+
+### LSM Tree (Log-Structured Merge-Tree) — for write-heavy
+\`\`\`
+Write path:
+  1. Append to commit log (durability)
+  2. Insert into in-memory memtable (sorted skip list)
+  3. When memtable full → flush to disk as SSTable (immutable, sorted file)
+  4. Background: compact multiple SSTables into fewer larger ones
+  
+Read path:
+  1. Check memtable
+  2. Check SSTables newest → oldest (Bloom filter to skip)
+  3. Return first match
+\`\`\`
+
+LSM is write-optimized: every write is sequential (commit log append + memtable insert). Compaction is the cost.
+
+### B-Tree — for read-heavy
+- Mutable on-disk pages
+- Reads in O(log N)
+- Writes require updating pages — random I/O (slower)
+- Postgres, MySQL InnoDB use B+ trees
+
+## Consistent Hashing & Replication
+- Hash ring; each key hashes to a position; node responsible = first node clockwise
+- N copies stored: at the responsible node + N-1 successors
+- Adding/removing nodes only affects ~1/N of keys
+
+## Read/Write Quorums (Tunable Consistency)
+\`\`\`
+N = replication factor (e.g., 3)
+W = replicas that must ack a write
+R = replicas that must respond to a read
+\`\`\`
+- **W + R > N** → strong consistency (read sees all completed writes)
+- **W = N, R = 1** → fast reads, slow writes, strong
+- **W = 1, R = 1** → fast both, eventual consistency
+- **W = quorum, R = quorum** → balanced
+
+Most apps run W=2, R=2, N=3 (quorum).
+
+## Detailed Component Design
+
+**Write path**:
+1. Client sends \`PUT key=val\` to coordinator
+2. Coordinator hashes key → identifies replica nodes
+3. Sends write to all N replicas in parallel
+4. Once W replicas ack → success returned to client
+5. Slower replicas receive hinted handoff if temporarily down
+
+**Read path**:
+1. Client sends \`GET key\`
+2. Coordinator queries R replicas in parallel
+3. If versions disagree → reconcile (read-repair, last-write-wins, or vector clocks)
+4. Return value to client; async push reconciled value to stale replicas
+
+**Conflict resolution**:
+- **Last Write Wins (LWW)**: timestamp-based; loses data on clock skew
+- **Vector clocks**: tracks causal history; detects conflicts; client resolves
+- **CRDTs**: data types that auto-merge (counters, sets, ordered lists)
+
+**Anti-entropy**:
+- Merkle trees per partition; replicas exchange and compare; sync diffs
+- Runs in background to converge replicas
+
+## Persistence Layer (LSM)
+- **Commit log**: append-only, fsync on write — durability
+- **Memtable**: sorted skip list in RAM
+- **SSTables**: immutable sorted files; bloom filters for quick "not present" checks
+- **Compaction strategies**:
+  - Size-tiered: like-sized SSTables compacted together (write-friendly)
+  - Leveled: levels of fixed size (read-friendly, more I/O)
+
+## Scaling Strategy
+- **Horizontal scale**: add nodes; consistent hashing rebalances
+- **Read replicas**: more replicas = more read throughput (but stale data more likely)
+- **Multi-region**: separate clusters per region; async replication; LWW conflict resolution
+- **Partitioning**: by key hash. For range queries, by key range (but creates hotspots).
+
+## Trade-offs & Bottlenecks
+- **Write amplification**: LSM compaction rewrites data multiple times. Trade-off: more compaction = slower writes but smaller storage and faster reads.
+- **Read amplification**: each read may check multiple SSTables. Bloom filters mitigate but don't eliminate.
+- **Hot keys**: a single popular key overwhelms one node. Solutions: replication, client-side caching, write-coalescing.
+- **Bottleneck**: coordinator overhead for high write rates. Use smart clients that hash directly.
+- **Tail latency**: stragglers on quorum reads. Hedged requests (issue redundant request after delay) help.
+
+## Follow-up Questions
+1. **Cassandra vs DynamoDB?** Cassandra is open source, self-hosted, full control. DynamoDB is managed, serverless, autoscaling. Same architectural ancestry (Dynamo paper).
+2. **How does Cassandra handle deletes?** Tombstones — marker records. Compacted away after gc_grace_seconds. Needed because delete must propagate to replicas.
+3. **What's a "secondary index" in a KV store?** Materialized view: another table sorted by indexed column. Cassandra has built-in but limited; better to maintain manually.
+4. **How would you support transactions?** Single-row CAS (compare-and-set) is easy. Multi-row requires coordinator (Spanner uses 2PC + Paxos). Most KV stores don't.
+5. **What's read repair vs hinted handoff?** Read repair: synchronously reconcile during read. Hinted handoff: temporarily store writes meant for a down node; deliver when it returns.
+6. **How does etcd / ZooKeeper differ?** They're KV stores too, but CP (strongly consistent via Raft / ZAB). Used for metadata/coordination, not bulk data.
+7. **What's the "sloppy quorum"?** If preferred replicas are down, write to other nodes temporarily (hinted handoff). Increases availability at cost of strict quorum semantics.`,
+
+  'Design Web Crawler': `## Functional Requirements
+- Discover and download web pages starting from seed URLs
+- Follow links (BFS/DFS through web graph)
+- Respect robots.txt and politeness policies
+- Detect and avoid duplicate content
+- Re-crawl pages periodically based on freshness needs
+- Extract links/text/metadata for indexing
+
+## Non-Functional Requirements
+- **Scale**: 1B+ pages crawled per day; 100B+ pages in index
+- **Politeness**: don't hammer single domains (≤ 1 req/sec per host typically)
+- **Freshness**: re-crawl frequently-updated pages more often
+- **Robustness**: handle malformed HTML, slow servers, infinite redirects
+- **Distributed**: many crawler workers in parallel
+
+## Capacity Estimation
+\`\`\`
+Pages/day:        1B  →  ~12K pages/sec
+Avg page size:    ~500KB raw HTML
+Bandwidth:        12K × 500KB = 6 GB/sec
+Storage (raw):    1B × 500KB = 500 TB/day  → tier to cold storage
+Storage (text):   ~50 KB extracted per page → 50 TB/day text
+URLs in queue:    100B+ (many discovered, slowly drained)
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+                  ┌─────────────────┐
+                  │   Seed URLs     │
+                  └────────┬────────┘
+                           ▼
+        ┌─────────────────────────────────────┐
+        │       URL Frontier (priority queue) │
+        │  - Per-host queues (politeness)      │
+        │  - Priority by importance/freshness │
+        └──────────────┬──────────────────────┘
+                       │
+         ┌─────────────┼─────────────┐
+         ▼             ▼             ▼
+   ┌─────────┐   ┌─────────┐   ┌─────────┐
+   │Fetcher 1│   │Fetcher 2│...│Fetcher N│   (10K+ workers)
+   └────┬────┘   └────┬────┘   └────┬────┘
+        │             │              │
+        ▼             ▼              ▼
+   ┌──────────────────────────────────┐
+   │ Raw HTML Storage (S3/HDFS)       │
+   └──────────────────────────────────┘
+        │
+        ▼
+   ┌──────────────────────────────────┐
+   │   Parser / Link Extractor        │
+   └──────┬─────────────────┬─────────┘
+          │                  │
+          ▼                  ▼
+   ┌──────────┐         ┌──────────┐
+   │Dedup     │         │ New URLs │
+   │(Bloom +  │ ──new──►│ → back   │
+   │ HashSet) │         │ to       │
+   └──────────┘         │ frontier │
+                        └──────────┘
+\`\`\`
+
+## Detailed Component Design
+
+### 1. URL Frontier (the brain)
+- **Per-host queues**: ensure politeness; ≤ 1 request/sec per domain
+- **Priority queue**: high-importance / outdated pages first
+- Implemented as: hashed buckets (one queue per host) with priority scheduling on top
+
+\`\`\`
+Frontend: priority queue of hosts ready to be crawled (next-fetch-time)
+Backend: per-host FIFO queue of URLs
+
+Worker:
+  pick host h from frontend that's ready (delay elapsed)
+  url = pop from h's backend queue
+  fetch(url)
+  schedule h for next-fetch-time = now + delay
+\`\`\`
+
+### 2. Fetcher
+- Async I/O for high concurrency (one process handles thousands of fetches)
+- DNS cache (avoid repeated lookups)
+- HTTP/2 connection reuse to same host
+- Timeouts: connect (5s), read (30s), total (60s)
+- Retry with backoff on transient errors
+
+### 3. Robots.txt
+- Per-host \`/robots.txt\` cached (TTL 24h)
+- Honors \`Disallow\`, \`Crawl-Delay\`, \`Sitemap\`
+- Skip URLs disallowed by robots before fetching
+
+### 4. Duplicate Detection
+- **URL canonicalization**: normalize protocol, host, sort query params, strip session IDs
+- **Bloom filter**: "have we seen this URL?" — fast, probabilistic
+- **Exact set**: confirm matches via DB lookup (Cassandra/Bigtable)
+- **Content dedup**: SimHash or shingles for near-duplicate detection (different URLs, same content)
+
+### 5. Parser
+- HTML → text + metadata + links
+- Robust against malformed HTML (use libraries like Beautiful Soup, Gumbo)
+- Extract \`<a href>\`, canonical URL, OpenGraph tags
+- For dynamic sites: headless Chrome (slower, used selectively)
+
+### 6. Re-crawl Scheduler
+- Frequency depends on page importance and change rate
+- News sites: hourly. Static blog: weekly. Old archive: monthly.
+- Track \`last_modified\`, \`change_score\`, \`importance_score\` per URL
+- Predict next change with Poisson model on observed change history
+
+## Politeness — The Critical Constraint
+Without it, you DDoS websites and get banned.
+- ≤ 1 request/sec per IP and per host (often slower)
+- Honor \`Crawl-Delay\` from robots.txt
+- Identify yourself in User-Agent (\`Googlebot/2.1\`)
+- Provide a contact email in User-Agent
+- Provide a way for site owners to opt out
+
+## Distributed Coordination
+- **URL frontier sharded by hostname hash** — keeps per-host politeness within one shard
+- Each fetcher worker handles a slice of hosts
+- New URLs discovered by parser routed to the correct shard
+
+## Scaling Strategy
+- **Horizontal scale**: more fetchers, more parser workers
+- **Geographically distributed**: crawl from multiple regions to reduce latency to target sites
+- **Shared frontier in Redis/Cassandra**: massive but manageable; bloom filter in front prevents most lookups
+- **Storage tiering**: hot (recent) on SSD, archival on object storage
+
+## Trade-offs & Bottlenecks
+- **Polite vs fast**: if you crawl too fast, you get blocked. If too slow, index is stale.
+- **DNS bottleneck**: serial DNS lookups slow crawls. Cache aggressively; use parallel resolvers.
+- **Spider traps**: pages with infinite calendars, parameterized URLs. Detect via depth limits, URL pattern detection.
+- **Bottleneck**: parsing (especially with headless browsers for JS-heavy sites). Limit JS-rendering to important pages.
+- **Cost**: bandwidth + storage are massive. Compress HTML before storing; tier old data to cold storage.
+
+## Follow-up Questions
+1. **How do you prioritize what to crawl?** PageRank-like importance + freshness + diversity. Don't waste budget on low-value sites.
+2. **What's a "spider trap"?** A site that auto-generates infinite URLs (calendars, search boxes). Detect via URL similarity, depth, repeated patterns.
+3. **How to handle JavaScript-heavy sites (SPA)?** Headless Chrome (Puppeteer). 10x slower; reserve for high-value sites.
+4. **What about deep web (search forms)?** Crawlers struggle. Some sites publish sitemaps to expose hidden content. Otherwise can't crawl.
+5. **How do you avoid getting blocked?** Respect robots, distribute IPs across many hosts, identify legitimately, don't drown small sites.
+6. **Real-time vs scheduled crawl?** PubSubHubbub / WebSub: site notifies crawler of changes. Useful for news. Otherwise, scheduled.
+7. **How does Google find new sites?** Sitemaps submitted via Search Console; links from already-crawled sites; explicit submission.`,
+
+  'Design Search Autocomplete': `## Functional Requirements
+- As user types, suggest top-K completions in real time
+- Suggestions ranked by popularity / recency / personalization
+- Sub-100ms response time
+- Multi-language support (Unicode, transliteration)
+- Typo tolerance (fuzzy matching)
+
+## Non-Functional Requirements
+- **Scale**: 1B queries/day → ~12K QPS, peak 50K QPS
+- **Latency**: < 100ms p99 (typed character to suggestion shown)
+- **Freshness**: trending terms reflected within minutes
+- **Availability**: 99.99%
+
+## Capacity Estimation
+\`\`\`
+Vocabulary:        10M unique queries (English)
+Avg query length:  ~20 chars
+Total trie size:   ~200 MB compressed → fits in RAM per server
+
+QPS:               50K peak
+Per-server QPS:    ~5K → 10 servers
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Client (browser, mobile)
+  │ debounced keystrokes
+  ▼
+┌────────────┐
+│   CDN      │  (cache common prefixes)
+└──────┬─────┘
+       │ miss
+       ▼
+┌────────────┐
+│Autocomplete│ ◄──── reads from
+│   Service   │      Trie / Inverted Index
+└──────┬─────┘
+       │
+       ▼
+┌────────────────────────────────┐
+│   In-memory data structure      │
+│   (Trie or sorted prefix index) │
+└──────┬─────────────────────────┘
+       │
+       │  rebuilt periodically (hourly)
+       ▼
+┌────────────────────────────────┐
+│    Aggregator                   │
+│  - Reads query logs from Kafka  │
+│  - Top-K per prefix             │
+│  - Personalization signals      │
+└────────────────────────────────┘
+\`\`\`
+
+## Core Data Structure: Trie
+
+\`\`\`
+        root
+       /  |  \\
+      a   b   c
+     /|   |    \\
+    d t   o     a
+       \\ /     /
+        op    t
+       /
+      _ → "atop" is a node end
+\`\`\`
+
+Each node stores:
+- \`children\` map: char → child node
+- \`is_end\`: marks complete word
+- **Top-K cache at each node**: precomputed list of best suggestions for this prefix
+
+The top-K cache is the key optimization. Without it, querying "ne" would require walking the entire subtree under "ne" and ranking — too slow. With it, lookup is O(prefix length).
+
+## Detailed Component Design
+
+### Trie Construction
+- Read all queries from past 30 days from query log
+- Group by prefix; rank by score = f(frequency, recency, CTR)
+- For each prefix node, store top 5-10 suggestions
+- Compress: shared sub-tries (DAFSA) save 50%+ memory
+
+### Query Flow
+1. User types "n" → request to autocomplete service
+2. Service walks trie: root → \`n\`
+3. Returns the precomputed top-K list at that node
+4. User types "ne" → return top-K at \`n → e\` node
+5. ~1 ms in-memory lookup
+
+### Real-time Updates (trending terms)
+- Stream of executed queries flows into Kafka
+- Aggregator computes incremental changes
+- Sliding window: last hour gets boost
+- Trie rebuild: periodic (hourly full rebuild + delta updates every 5 min)
+- Hot-swap new trie atomically (no downtime)
+
+### Personalization
+- User-level: their own query history boosts terms they search often
+- Implementation: small per-user trie merged with global trie at query time
+- Or: re-rank global suggestions using user features
+
+### Typo Tolerance
+- **Edit distance via BK-tree**: lookup all words within edit distance ≤ 2
+- **Levenshtein automata**: efficient per-prefix fuzzy match
+- **Phonetic** (Soundex, Metaphone): match by sound for spelling variants
+- Combine: exact prefix match preferred, fuzzy as fallback
+
+## API Design
+\`\`\`
+GET /api/autocomplete?q=ne&limit=10&user_id=...
+  Response:
+  {
+    suggestions: [
+      { text: "netflix", score: 0.95 },
+      { text: "news", score: 0.92 },
+      { text: "neil young", score: 0.87 },
+      ...
+    ]
+  }
+\`\`\`
+
+## Scaling Strategy
+- **In-memory only**: trie fits in RAM. No disk I/O on critical path.
+- **Read replicas**: dozens of servers, all hold full trie. Stateless after rebuild.
+- **Caching at CDN**: top-most popular prefixes cached. ~70% of queries are popular.
+- **Sharding by prefix** (only if trie too large): different servers own different first-letter prefixes. Add a router.
+- **Multi-region**: each region has its own trie, possibly with regional bias (queries common in that region rank higher).
+
+## Trade-offs & Bottlenecks
+- **Memory vs depth of suggestions**: more top-K per node = more memory. Tune.
+- **Freshness vs cost**: rebuilding trie every minute is expensive. Hourly + delta updates is a sweet spot.
+- **Personalization vs latency**: deep personalization adds compute. Cache personalized results per user.
+- **Bottleneck**: trie rebuild time. For 10M queries, can take minutes. Build offline; hot-swap.
+- **Spam / abuse**: malicious bots can poison suggestions by querying gibberish. Filter low-quality queries before ranking.
+
+## Follow-up Questions
+1. **Trie vs database with prefix LIKE 'ne%'?** Trie is 100x faster — purpose-built for prefix queries. DB \`LIKE\` is OK for low-traffic.
+2. **What's a DAFSA?** Deterministic Acyclic Finite State Automaton. Compressed trie that shares both prefixes and suffixes. Massive memory savings.
+3. **How to handle Unicode (Chinese, Japanese)?** Tokenize input characters; trie nodes are characters not bytes. Asian languages: smaller trie depth (1-3 chars) but huge breadth.
+4. **How to rank ties (same score)?** Alphabetical, recency, length (shorter = better usually).
+5. **What about content suggestions (e.g., autocomplete books on Amazon)?** Different signals: in-stock, price, click-through. More complex ranking model.
+6. **What about real-time suggestions (events, news)?** Faster trie rebuilds (1-min delta). Real-time signal sources (Twitter trends, breaking news).
+7. **How to handle a word that's just emerged (e.g., "covid" in 2020)?** Trending detector: monitors query velocity. Words with sudden spikes inserted with boosted score immediately.`,
+
+  'Design Notification System': `## Functional Requirements
+- Send notifications via multiple channels: push (mobile), email, SMS, in-app
+- User preferences: opt-in/out per channel and category
+- Templates with variable substitution
+- Scheduling (immediate or future)
+- Batching/aggregation ("John and 3 others...")
+- Delivery tracking and retries
+
+## Non-Functional Requirements
+- **Scale**: 10B notifications/day → ~115K/sec average, ~500K/sec peak
+- **Latency**: < 5 seconds for time-sensitive (e.g., security alerts)
+- **Reliability**: at-least-once delivery; deduplicate downstream
+- **Multi-region**: each region serves its users
+- **Compliance**: GDPR, CAN-SPAM, TCPA — must respect unsubscribes globally
+
+## Capacity Estimation
+\`\`\`
+Notifications/day:    10B
+Channels split:       60% push, 30% email, 5% SMS, 5% in-app
+Push:                 6B/day → 70K/sec
+Email:                3B/day → 35K/sec
+Storage:              metadata 200 bytes × 10B/day × 30-day retention = 60 TB
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Producers (microservices, batch jobs, real-time events)
+   │
+   ▼
+┌──────────────────────────┐
+│  Notification API         │
+│  - validate, dedup        │
+│  - apply user preferences │
+└────────────┬──────────────┘
+             │
+             ▼
+        ┌────────┐
+        │ Kafka  │ ← topic: notification_events
+        └───┬────┘
+            │
+   ┌────────┼─────────┬──────────────┐
+   ▼        ▼         ▼              ▼
+┌──────┐┌────────┐┌────────┐    ┌────────┐
+│Push  ││Email   ││  SMS   │    │ In-App │
+│Worker││Worker  ││Worker  │    │ Worker │
+└──┬───┘└────┬───┘└────┬───┘    └────┬───┘
+   │         │          │              │
+   ▼         ▼          ▼              ▼
+APNS/FCM  SendGrid   Twilio       WebSocket
+                                  Service
+\`\`\`
+
+## Detailed Component Design
+
+### 1. Notification API
+- Producers call a single API: \`POST /api/notifications\`
+- Validates: schema, rate limits per producer, user preference check
+- Applies templates: \`Hi {{name}}, your order is shipped\` + data → final text
+- Dedups: hash of (user_id, template_id, payload) within 5-min window — prevents storm of identical notifications
+- Publishes to Kafka
+
+### 2. User Preferences Service
+- Stores per-user, per-channel, per-category prefs
+- Cached in Redis with 5-min TTL
+- API call gated through this: if user opted out, drop notification immediately
+- Schema:
+\`\`\`
+user_id | channel | category    | enabled | last_sent_at
+123     | push    | promotions  | false   | 2024-...
+123     | email   | order_status| true    | ...
+\`\`\`
+
+### 3. Channel Workers
+**Push (APNS/FCM)**:
+- Maintain device tokens per user (multiple devices)
+- Batch 100-1000 messages per HTTP/2 request to APNS/FCM
+- Handle rejection: invalid token → mark for cleanup
+- Apple/Google rate-limit; respect their backoff
+
+**Email**:
+- Use a transactional email provider (SendGrid, SES, Postmark)
+- DKIM/SPF/DMARC for deliverability
+- Bounce handling: hard bounces → mark email invalid; soft → retry later
+- Unsubscribe link in every email (legal + best practice)
+
+**SMS**:
+- Twilio / SNS for delivery
+- Cost-sensitive (SMS is expensive); strict rate limits
+- Trim long messages; truncate or split
+
+**In-App**:
+- WebSocket connection per active user
+- If user offline, mark unread; deliver on next connection
+- Persist in DB so list can be retrieved on app open
+
+### 4. Aggregation / Batching
+- Some notifications should be grouped: "John, Mary, and 5 others liked your post"
+- Aggregator service: holds messages in a window (1 min for likes, 1 hour for digests)
+- Triggers single notification at window end
+
+### 5. Scheduling
+- Future-dated notifications stored in a delay queue (Redis sorted set by send_at, or AWS SQS delayed messages)
+- Scheduler polls due items, publishes to Kafka
+
+### 6. Tracking & Analytics
+- Each notification has a unique ID
+- Channel workers emit events: SENT, DELIVERED, OPENED, CLICKED, BOUNCED
+- Aggregated for analytics (open rates, etc.)
+- Used for ML re-ranking and frequency capping
+
+## Database Schema
+\`\`\`
+notifications (Cassandra, partition: user_id)
+  notification_id, user_id, channel, status, created_at, sent_at, content
+
+devices (Postgres)
+  device_id, user_id, push_token, platform (ios/android), last_seen_at
+
+preferences (Postgres + Redis cache)
+  user_id, channel, category, enabled
+
+unsubscribes (Postgres) — append-only log for legal audit
+  email, unsubscribed_at, source
+
+templates (Postgres)
+  template_id, channel, subject, body, variables
+\`\`\`
+
+## Scaling Strategy
+- **Kafka throughput**: 100K-1M msg/sec per cluster easily
+- **Channel workers**: independently scaled. Push needs more workers than SMS due to volume.
+- **APNS/FCM batching**: each HTTP/2 conn = thousands of pushes/sec. 100 connections per worker.
+- **Multi-region producers, single-region channels**: legal — emails from US providers; pushes from regional APNS endpoints.
+- **Frequency capping**: Redis counter per user per category. Max N notifications/day. Critical for retention (don't spam users).
+
+## Trade-offs & Bottlenecks
+- **At-least-once delivery means dedup downstream**: notification ID unique; recipient client/inbox dedups
+- **Latency vs batching**: batching to APNS is cheaper but adds delay. Tune batch size/timeout per priority.
+- **Quality of email deliverability**: ratio matters. Sending to non-engaged users → spam folder for everyone. Suppress dormant users.
+- **Bottleneck**: third-party providers (APNS, SendGrid). Their outages = your outage. Multi-provider for redundancy on critical paths.
+- **Compliance complexity**: GDPR right-to-be-forgotten, CAN-SPAM unsubscribe within 10 days, TCPA SMS consent. Audit trail mandatory.
+
+## Follow-up Questions
+1. **Why use Kafka instead of HTTP between services?** Decouples producers from channel workers. Bursts buffered in Kafka; workers process at their pace. Replay possible after worker bug.
+2. **How do you handle a device without internet?** Push: APNS/FCM hold for ~24h. Email: stays in inbox. SMS: carrier holds. In-app: persisted, shown on next open.
+3. **Personalized send time?** ML model learns each user's optimal send time (when they engage). Schedule accordingly. Marketing-only feature — security alerts always immediate.
+4. **What about A/B testing notification copy?** Each notification carries variant ID; engagement events tagged with variant. Stats engine compares.
+5. **How to prevent notification storms?** Frequency cap per (user, category). Rate-limit producers. Dedup window. Aggregation.
+6. **What if user's email bounces forever?** Hard bounce → suppression list, never email again. Soft bounce → retry with backoff up to N times, then suppress.
+7. **How does Slack do real-time notifications?** WebSocket persistent conn; broadcast on relevant events; fall back to push if user offline; aggressive frequency capping.`,
+
+  'Design Parking Lot': `## Functional Requirements
+- Park a vehicle: assign a spot based on vehicle type (motorcycle, car, truck)
+- Unpark: free the spot, calculate fee
+- Spot pricing tiers (handicap, EV charging, premium)
+- Multiple entry/exit gates
+- Display available spots in real-time
+- Multiple parking lots in a chain (multi-tenant)
+
+## Non-Functional Requirements
+- **Scale**: 10K parking lots, 1K spots each → 10M total spots
+- **Latency**: < 200ms for park/unpark operations
+- **Concurrency**: many simultaneous park requests at peak (rush hour)
+- **Availability**: 99.9% — gates work even if backend slow
+- **Consistency**: strong (must not double-allocate a spot)
+
+## API Design
+\`\`\`
+POST /api/parking/enter         { lot_id, vehicle: { type, plate } }
+                                → { ticket_id, assigned_spot, entry_time }
+
+POST /api/parking/exit          { ticket_id }
+                                → { fee, duration, payment_url }
+
+GET  /api/parking/lot/:id/availability
+                                → { total, available, by_type: {...} }
+
+POST /api/parking/lot/:id/spot/:spot_id/reserve  (premium feature)
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+   Entry/Exit Gates (kiosks, license plate cameras)
+              │
+              ▼
+   ┌──────────────────┐
+   │  API Gateway     │
+   └────────┬─────────┘
+            │
+   ┌────────┼────────────┐
+   ▼        ▼            ▼
+┌────────┐ ┌──────────┐ ┌──────────┐
+│ Park   │ │ Spot     │ │ Pricing  │
+│Service │ │ Allocator│ │ Service  │
+└───┬────┘ └────┬─────┘ └────┬─────┘
+    │           │             │
+    │           ▼             │
+    │     ┌──────────┐        │
+    │     │  Redis   │ ◄──────┤
+    │     │  (spots) │
+    │     └──────────┘
+    │
+    ▼
+┌─────────────────────────┐
+│   Postgres              │
+│  - tickets              │
+│  - lots, spots metadata │
+│  - payments             │
+└─────────────────────────┘
+\`\`\`
+
+## Database Schema
+\`\`\`sql
+parking_lots
+  lot_id, name, location, total_spots, operating_hours
+
+spots
+  spot_id, lot_id, level, row, type (motorcycle|car|truck|handicap|ev),
+  rate_per_hour, status (free|occupied|reserved)
+
+tickets
+  ticket_id, lot_id, spot_id, vehicle_plate, vehicle_type,
+  entered_at, exited_at, fee, payment_status
+
+payments
+  payment_id, ticket_id, amount, method, status, processed_at
+
+-- Indexes
+CREATE INDEX idx_spots_lot_status ON spots(lot_id, status, type);
+CREATE INDEX idx_tickets_active ON tickets(lot_id) WHERE exited_at IS NULL;
+\`\`\`
+
+## Detailed Component Design
+
+### Spot Allocator (the interesting bit)
+**Naive approach**: \`SELECT spot_id FROM spots WHERE lot_id=? AND status='free' AND type=? LIMIT 1\`
+- Race condition: two parkers might be assigned the same spot
+- Solution: \`SELECT ... FOR UPDATE\` (row-level lock) — works for low concurrency
+- Bottleneck at high concurrency: lock contention
+
+**Better: in-memory with Redis**
+- For each lot, maintain a Redis sorted set of free spots per type:
+  - \`SADD lot:{lot_id}:free:car spot_id_1 spot_id_2 ...\`
+- Allocate: \`SPOP lot:{lot_id}:free:car\` (atomic; Redis is single-threaded)
+- Release: \`SADD lot:{lot_id}:free:car spot_id\`
+- Persist final state to Postgres async
+
+**Best: deterministic assignment** for fairness or proximity
+- Maintain spot priority (closest to entrance first)
+- Redis sorted set with priority as score: \`ZPOPMIN lot:{lot_id}:free:car\`
+
+### Park Flow
+1. Camera reads plate or driver takes ticket at gate
+2. API: validate vehicle type, check availability
+3. Allocator: ZPOPMIN best free spot for type
+4. Create ticket record (Postgres)
+5. Display assigned spot to driver
+6. Entry barrier raised
+
+### Unpark Flow
+1. Driver taps ticket / camera reads plate at exit
+2. Lookup ticket → calculate duration → fee
+3. Process payment (or accept payment beforehand for unstaffed lots)
+4. Free the spot in Redis
+5. Update Postgres ticket with exit time and fee
+6. Open exit barrier
+
+### Real-time Availability Display
+- Counter in Redis: \`lot:{lot_id}:available:car\`, \`lot:{lot_id}:available:motorcycle\`
+- Updated atomically (DECR on park, INCR on exit)
+- Display screens poll every few seconds, or push via WebSocket
+
+## Object-Oriented Design (often what interviewers ask)
+
+\`\`\`
+Vehicle (abstract)
+  ├ Motorcycle
+  ├ Car
+  └ Truck     (size matters for spot allocation)
+
+Spot (abstract)
+  ├ MotorcycleSpot (fits motorcycles only)
+  ├ CompactSpot    (fits motorcycles, cars)
+  └ LargeSpot      (fits all)
+
+ParkingLot
+  - levels: List<Level>
+  - findSpot(vehicle): Spot
+  - park(vehicle): Ticket
+  - unpark(ticket): Fee
+
+Level
+  - spots: List<Spot>
+  - availableSpots(type): int
+
+Ticket
+  - id, vehicle, spot, entryTime, fee
+
+PricingStrategy (interface)
+  - calculate(duration, spot): Fee
+  Implementations: HourlyPricing, FlatFee, DynamicPricing
+\`\`\`
+
+Patterns: **Strategy** (pricing), **Factory** (vehicle/spot creation), **State** (ticket state machine).
+
+## Scaling Strategy
+- **Per-lot Redis cluster**: each lot's state isolated. Lot of 1K spots → trivial RAM.
+- **Many lots, one DB**: shard tickets table by lot_id
+- **Multi-region**: each region's data center handles its lots; rare cross-region queries
+- **Edge resilience**: gates have local cache; can park even if backend slow (sync later); exit always works (fee calculated later if needed)
+
+## Trade-offs & Bottlenecks
+- **Strong consistency required** for spot allocation — Redis atomic ops, not eventual consistency
+- **Pricing complexity**: tiered rates, peak/off-peak, monthly passes, promotions. Strategy pattern essential.
+- **Lost ticket scenarios**: charge maximum fee or require ID + plate match. Operational policy.
+- **Integration with payment**: always async — never block exit on payment processor latency
+- **Bottleneck**: at peak (e.g., concert end), all 1000 cars exit in 30 min = 30 exits/sec/lot. Easily handled but plan for it.
+
+## Follow-up Questions
+1. **What if Redis goes down?** Read availability from Postgres (slower); spot allocation falls back to row-level lock. Degraded but functional.
+2. **How to handle a stuck vehicle (parked > N days)?** Alert generated. Lot operator escalates. Vehicle towed; spot freed manually.
+3. **Premium reservations?** Pre-book a specific spot for a window. Reservation system overlays spot availability. Conflict on walk-in if reserved spot is taken.
+4. **Dynamic pricing (Uber for parking)?** Adjust rate based on occupancy. > 90% full = surge. Communicates urgency and shifts demand.
+5. **EV charging stations?** Special spot type. Charging time vs parking time differ. May need separate billing for kWh.
+6. **Multi-level lot routing?** "Closest available spot to entry" requires graph of paths. Pathfinding (BFS) on spot grid.
+7. **Plate-recognition fraud?** Camera misread → wrong charge. Always allow manual override. Log all reads for audit.`,
+
+  'Design Google Drive': `## Functional Requirements
+- Upload, download, delete files
+- Folders / hierarchical organization
+- File sharing (link, user-level, permissions)
+- Version history (revisions)
+- Sync across devices (desktop, mobile)
+- Search (file name, content)
+- Real-time collaboration (basic — for Docs see Doc-specific design)
+
+## Non-Functional Requirements
+- **Scale**: 2B users, 100PB+ stored, 100M files uploaded/day
+- **Latency**: < 1 second for metadata operations
+- **Throughput**: large file uploads at line speed (100 Mbps+ per user)
+- **Durability**: 11 nines (lose 1 file per 10^11)
+- **Availability**: 99.99% for metadata, 99.9% for media
+
+## Capacity Estimation
+\`\`\`
+Files/day:        100M  →  ~1.2K/sec
+Avg file size:    ~5 MB (mix of docs, photos, videos)
+Daily ingestion:  500 TB/day
+5-year storage:   ~1 EB (exabyte)
+
+Replication:      3x → 3 EB physical
+Plus erasure coding for cold tier → 1.4x effective
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Client (web, desktop sync, mobile)
+   │
+   ▼
+┌──────────────────┐
+│  API Gateway     │
+└────────┬─────────┘
+         │
+   ┌─────┼──────────┬──────────┬──────────┐
+   ▼     ▼          ▼          ▼          ▼
+┌──────┐┌────────┐┌────────┐┌──────────┐┌──────────┐
+│Meta  ││Block   ││ Sync   ││ Sharing  ││ Search   │
+│Service││Storage ││Service ││ Service  ││ Service  │
+└──┬───┘└───┬────┘└───┬────┘└────┬─────┘└────┬─────┘
+   │        │          │           │           │
+   ▼        ▼          ▼           ▼           ▼
+┌────────────────────────────────────────────────────┐
+│  Postgres/Spanner   │   Object Storage (Colossus/S3) │
+│  - file metadata     │   - actual file blocks         │
+│  - permissions       │   - chunked, deduped           │
+│  - versions          │                                  │
+└────────────────────────────────────────────────────┘
+                                │
+                                ▼
+                         ┌──────────────┐
+                         │ ElasticSearch│ (file content/name index)
+                         └──────────────┘
+\`\`\`
+
+## Storage Model — Block-Level Deduplication
+
+**Key insight**: don't store files as opaque blobs. Split into fixed-size **blocks** (e.g., 4 MB chunks), hash each, and dedupe across all users.
+
+\`\`\`
+file.docx (12 MB):
+  block_1 = first 4 MB    → SHA-256 = abc123  → stored once globally
+  block_2 = next 4 MB     → SHA-256 = def456
+  block_3 = last 4 MB     → SHA-256 = ghi789
+
+Metadata: file → [block_hash_1, block_hash_2, block_hash_3]
+\`\`\`
+
+Benefits:
+- Same file uploaded by 1M users → stored once
+- Re-upload of slightly modified file → only changed blocks transmitted
+- "Resumable upload" trivial — track which blocks done
+
+## Database Schema
+\`\`\`
+files (Spanner / Postgres)
+  file_id, parent_folder_id, owner_id, name, size,
+  mime_type, created_at, modified_at, version, deleted
+
+folders (same)
+  folder_id, parent_folder_id, owner_id, name
+
+blocks (mapping)
+  file_id, sequence, block_hash, size
+
+block_storage (object store; key = block_hash)
+  → actual bytes
+
+permissions
+  resource_id (file or folder), grantee_id (user/group/link),
+  role (viewer | commenter | editor | owner)
+
+shares (links)
+  share_id (random token), resource_id, expires_at, password_hash?
+
+versions (Cassandra, partition: file_id)
+  file_id, version, modified_at, blocks[], modifier_id
+\`\`\`
+
+## Detailed Component Design
+
+### Upload Flow
+1. Client splits file into 4MB blocks, hashes each
+2. Client requests \`/upload/init\` with list of block hashes + sizes + file metadata
+3. Server:
+   - Reserves a file_id
+   - Returns: which blocks are already in storage (skip), which need uploading
+4. Client uploads missing blocks (parallel, multipart) — directly to object storage with pre-signed URLs
+5. On all blocks complete, client calls \`/upload/finalize\`
+6. Server creates file record in metadata DB, links blocks
+7. Async: index file content for search; warm CDN if shared publicly
+
+### Download Flow
+1. Client requests \`/files/:id\`
+2. Metadata service returns block list with signed URLs
+3. Client downloads blocks in parallel from object storage
+4. Client reassembles → presents file
+
+### Sync (the hard part)
+**Polling vs push**: a desktop client must reflect changes without constant polling.
+
+**Approach: long-polling + event log**
+- Each user has an event log: \`(user_id, event_id, timestamp, change)\`
+- Client maintains last_synced_event_id
+- Long-polls: \`GET /sync?since=event_id\` — server holds connection 30s, returns changes when available
+- Multiple devices keep in sync via the same log
+
+**Conflict resolution**:
+- Both devices edit offline → "create copy" (rename one with conflict suffix)
+- For documents, requires CRDTs or operational transform (separate service)
+
+### Sharing & Permissions
+- **Direct grant**: \`(file, user, role)\` — fast lookup
+- **Inherited**: folder permissions cascade to children. Must check ancestor chain on every read.
+- **Optimization**: denormalize effective permissions cache; recompute on parent change
+- **Link sharing**: random token → permissions. Validate at access time.
+
+### Search
+- Index file name, owner, type → Elasticsearch (always)
+- Index file content (PDF, Word, etc.): extracted on upload via worker pool, indexed asynchronously
+- Permissions enforced at search time: filter results to what user can access
+
+## Scaling Strategy
+- **Object storage** (Colossus/S3) scales to exabytes natively. Block-level dedup reduces footprint 30-50%.
+- **Metadata** is the harder scaling problem. Spanner / sharded Postgres. Partition by user_id.
+- **Hot files** (popular shared docs): cache metadata in Redis, content via CDN
+- **Cold tier**: files unchanged > 1 year moved to cheaper tier (Glacier-like). Block storage with erasure coding instead of 3x replication.
+- **Multi-region**: metadata in nearest region; blocks geo-replicated for DR; reads from nearest region
+
+## Trade-offs & Bottlenecks
+- **Dedup vs encryption**: client-side encryption breaks dedup (each user's encrypted block is unique). Most products dedup before encryption (server holds keys).
+- **Sync conflict resolution**: file-level "create copy" is simple but bad UX. Doc-level CRDT requires document-aware service.
+- **Permission complexity**: cascading folder permissions O(depth) per check. Cache aggressively; invalidate on grant changes.
+- **Bottleneck**: metadata DB writes during sync storms (e.g., 10K-file folder shared with team). Batch writes, throttle if needed.
+- **Storage cost**: dominant. Lifecycle to cold storage; encourage users to delete.
+
+## Follow-up Questions
+1. **How does Dropbox dedup?** Block-level + per-user salt: each user's block hash = sha(content || user_salt). Avoids cross-user dedup but enables convergent encryption per-user.
+2. **What about end-to-end encryption?** Client-side encryption breaks dedup and search. Some services (Tresorit) prioritize privacy; Drive prioritizes features.
+3. **How would real-time co-editing work?** Operational Transform (OT) or CRDTs. A separate document service holds in-memory state; persists to Drive periodically. (See Google Docs.)
+4. **What's a thumbnail strategy?** On upload, async worker generates multiple sizes; stored separately; served from CDN. Lazy-generated for old files.
+5. **Trash / soft delete?** Set \`deleted=true\` on file; auto-purge after 30 days. Storage lifecycle: move to cold tier first, then delete blocks.
+6. **How to detect malware?** ClamAV / VirusTotal scan on upload (async). Block download if flagged. Manual review queue.
+7. **Differences from S3?** S3 is raw object storage. Drive is user-facing with metadata, search, sharing, sync, versioning. Drive likely uses S3-equivalent (Colossus) underneath.`,
+
+  'Design Logging System': `## Functional Requirements
+- Collect logs from thousands of services/hosts
+- Centralize storage with searchability
+- Real-time tail (kubectl logs -f equivalent at scale)
+- Long-term archival
+- Alerting on log patterns (error spikes)
+- Multi-tenant: isolate logs by team/service
+
+## Non-Functional Requirements
+- **Scale**: 10M log lines/sec across the fleet (~1 PB/day)
+- **Latency**: < 5 seconds from emit to searchable (real-time tail)
+- **Retention**: 7 days hot, 90 days warm, 1 year cold
+- **Availability**: 99.9% (logs are diagnostic; brief outages tolerable)
+- **Durability**: don't lose logs (debugging needs them)
+
+## Capacity Estimation
+\`\`\`
+Logs/sec:       10M lines × ~500 bytes = 5 GB/sec ingest
+Daily volume:   ~430 TB
+Compressed:     ~10x → 43 TB/day on disk
+Retention:      7 days hot = 300 TB SSD; 90 days warm = 4 PB HDD; archive = S3
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Application Hosts (10K+)
+   │
+   │ stdout/stderr → Fluent Bit / Filebeat agent
+   ▼
+┌──────────────────────────────────┐
+│   Log Aggregator (per host)      │
+│   - tail files                   │
+│   - structured (JSON) parsing    │
+│   - batch + compress              │
+└──────────┬───────────────────────┘
+           │
+           ▼
+   ┌──────────────┐
+   │    Kafka     │  ← buffer, decouple producers from indexers
+   └──────┬───────┘
+          │
+   ┌──────┼───────────┐
+   ▼      ▼           ▼
+┌──────┐┌──────────┐┌──────────┐
+│Index ││ Storage  ││  Stream  │
+│Worker││ Tier     ││ Processor│
+└──┬───┘└────┬─────┘└────┬─────┘
+   │         │            │
+   ▼         ▼            ▼
+┌────────┐┌────────┐┌──────────┐
+│ Elastic││  S3    ││ Alerts/  │
+│ search ││ (cold) ││ Anomaly  │
+│ /Loki  ││        ││ Detector │
+└────┬───┘└────────┘└──────────┘
+     │
+     ▼
+   Query API → Kibana / Grafana
+\`\`\`
+
+## Detailed Component Design
+
+### Agent (Fluent Bit / Vector / Filebeat)
+- Tails log files; reads stdout/stderr via Docker JSON driver
+- Adds metadata (host, container, pod, service, environment)
+- Parses structured logs (JSON); falls back to free-text
+- Buffers locally on disk if upstream unavailable (resilience)
+- Compresses (snappy/gzip) before sending
+- Backpressure: drops or samples if Kafka pressured
+
+### Kafka Buffer
+- Decouples producers (millions of containers) from indexers
+- Topic per cluster or per service tier (\`logs-prod\`, \`logs-dev\`)
+- Partition by service/host hash for ordering within source
+- Retention 24-72h: enough for indexer recovery from outage
+
+### Indexing Tier
+**Choice between Elasticsearch and Loki**:
+- **Elasticsearch**: full-text inverted index. Powerful queries. Expensive (3x storage overhead). Complex ops.
+- **Loki (Grafana)**: indexes only labels (service, host); log content stored as compressed chunks. Cheap. Less powerful search but ~10x cheaper.
+
+For most companies, **Loki for high-volume + Elasticsearch for security/audit logs** is a good split.
+
+### Storage Tiers
+- **Hot** (SSD, ES/Loki): last 7 days; queryable in seconds
+- **Warm** (HDD or larger ES nodes): last 30-90 days; slower queries
+- **Cold** (S3 + Athena/Presto): 1+ year; rarely queried; cheap
+
+Lifecycle policy moves indexes between tiers automatically.
+
+### Search & Query API
+- Query language: Lucene (ES), LogQL (Loki), or custom
+- Time range + filter + aggregation: \`service=order AND status=500 | last 1h | count by host\`
+- Multi-tenant: queries scoped to user's accessible services (RBAC)
+
+### Alerting
+- Stream processor (Flink/Kafka Streams) reads logs, applies rules
+- Rule: "error rate > 1% over 5 min" → triggers alert
+- Send to PagerDuty/Slack
+- Avoid alert spam: dedup, rate-limit
+
+## Database / Index Schema
+\`\`\`
+Document (Elasticsearch):
+{
+  "@timestamp": "2024-01-15T10:30:00Z",
+  "service": "order-service",
+  "host": "host-42",
+  "level": "ERROR",
+  "trace_id": "abc-123",
+  "message": "Failed to charge card: insufficient funds",
+  "user_id": 9876,
+  "elapsed_ms": 230
+}
+
+Index pattern: logs-{service}-{date}  e.g., logs-order-2024.01.15
+Index per day → easy lifecycle management
+\`\`\`
+
+## Scaling Strategy
+- **Sharded ES indices**: each daily index has N shards based on volume. Time-based indices avoid massive single index.
+- **Hot/warm node tiering** in Elasticsearch: hot indices on SSD nodes, warm shifted to HDD nodes
+- **Loki for high-volume tier**: cheaper at scale
+- **Sampling**: sample debug logs (1%) on high-traffic services. Full retention for ERROR/WARN.
+- **Multi-region**: each region has its own logging stack; cross-region queries via federation
+
+## Trade-offs & Bottlenecks
+- **Storage cost** is the dominant concern. Aggressive compression, tiering, sampling.
+- **Cardinality explosion**: too many unique label values in Loki/Prom blow up index. Don't put user_id as a label.
+- **PII concerns**: logs often leak user data. Scrub at source (regex on email, phone, credit card patterns) or use differential privacy.
+- **Bottleneck**: Elasticsearch indexing CPU. Bulk-batch writes. Use ingest nodes for parsing.
+- **Search at scale**: queries over 30 days × PB scale are slow. Pre-aggregate common patterns; use approximate count via sketches.
+
+## Follow-up Questions
+1. **How to ensure no log loss?** Agent buffers to disk locally; Kafka durable storage; indexer retries. Trade-off: stronger guarantees = more local storage on hosts.
+2. **What about distributed tracing?** Different system (Jaeger/Tempo). Logs reference trace_id; jump from log to trace seamlessly.
+3. **How would you compress logs?** Snappy (fast) at ingestion, zstd (better ratio) at storage. Block-level on storage tier.
+4. **What if a single service generates noisy logs that slow everyone?** Per-service ingestion quotas. Throttle or reject; alert team to fix.
+5. **Sensitive data leakage prevention?** Linters in CI for known patterns (\`SSN=\`, \`token=\`). Regex scrubber at ingestion. Audit trail for human-accessed PII.
+6. **Cost optimization tactics?** Sample debug logs heavily, retain ERROR fully. Compress aggressively. Cold tier sooner. Use Loki for non-text-search logs.
+7. **How do logs differ from metrics?** Logs = events with rich structure but high cost; metrics = numeric time series, cheap and aggregable. Use metrics for monitoring, logs for forensics.`,
+
+  'Design Metrics System': `## Functional Requirements
+- Collect time-series metrics from services (counters, gauges, histograms)
+- Real-time dashboards
+- Alerting on thresholds and anomalies
+- Multi-dimensional labels (service, region, status, etc.)
+- Aggregations (sum, avg, percentiles)
+- Long-term retention with downsampling
+
+## Non-Functional Requirements
+- **Scale**: 100M time series, 10M data points/sec ingest
+- **Latency**: < 30 seconds from emission to dashboard
+- **Query latency**: < 1s for typical dashboard panel
+- **Retention**: 15 days raw, 1 year downsampled, 5+ years summarized
+- **Availability**: 99.9% — outage hides incidents
+
+## Capacity Estimation
+\`\`\`
+Active series:     100M  (each is a unique label combination)
+Sample rate:       1 per 15 sec  → 6.7M points/sec ingest
+Compressed size:   ~1-2 bytes per point (Gorilla compression)
+Daily storage:     ~1 TB raw → ~70 GB compressed
+15-day retention:  ~1 TB hot
+\`\`\`
+
+## High-Level Architecture (Prometheus-style)
+\`\`\`
+Application instances
+   │
+   │ /metrics endpoint exposing Prometheus format
+   ▼
+┌─────────────────────────┐
+│  Scrapers (or Agent     │
+│  push-based)            │
+└──────────┬──────────────┘
+           │
+           ▼
+   ┌──────────────┐
+   │   Ingester   │   (writes to TSDB)
+   └──────┬───────┘
+          │
+          ▼
+   ┌──────────────┐
+   │   TSDB       │   (Prometheus / Cortex / Mimir / VictoriaMetrics / TimescaleDB)
+   └──────┬───────┘
+          │
+   ┌──────┼─────────┐
+   ▼      ▼          ▼
+┌──────┐┌──────┐┌──────────┐
+│Query ││Alert ││Downsample│
+│Engine││Mgr   ││ Compactor│
+└──┬───┘└──┬───┘└────┬─────┘
+   │       │           │
+   ▼       ▼           ▼
+Grafana  PagerDuty/  S3 (cold)
+         Slack
+\`\`\`
+
+## Pull vs Push
+
+| | Pull (Prometheus) | Push (StatsD, Datadog) |
+|---|---|---|
+| Discovery | Scraper finds targets via service discovery | Each instance pushes |
+| Failure detection | "Target down" is built-in | Easy to lose data on instance crash |
+| Auth | Single scrape endpoint | Each push authenticated |
+| Network | Scraper needs reachability | Works behind NAT |
+| Best for | K8s, dynamic infra | Short-lived jobs, batch |
+
+Most modern stacks use pull (Prometheus) for primary, push gateway for short-lived jobs.
+
+## Time Series Database Internals
+
+**A time series** = (metric_name, labels) → list of (timestamp, value)
+\`\`\`
+http_requests_total{service="api", status="500", method="GET"}
+  → [(t1, 1024), (t2, 1031), (t3, 1045), ...]
+\`\`\`
+
+**Key data structure: Gorilla-style compression**
+- Delta-of-delta encoding for timestamps (most are regular intervals)
+- XOR encoding for floats (consecutive values usually similar)
+- Result: 1-2 bytes/point average vs 16 bytes raw
+
+**Index for label search**:
+- Inverted index: \`service=api\` → set of series IDs
+- Query "service=api AND status=500" = intersect two sets
+- TSDB tradition: per-block indices to keep size manageable
+
+**Storage layout**:
+- Time blocks of fixed duration (e.g., 2h)
+- Each block self-contained: index + chunks
+- Old blocks compacted into bigger blocks
+- Eventually shipped to object storage (cold tier)
+
+## Detailed Component Design
+
+### Scraper / Agent
+- Service discovery: K8s API, Consul, file-based
+- Scrape interval: 15-60s typical
+- Each scrape parses Prometheus exposition format
+- Per-job timeout (e.g., 10s); failed scrapes generate \`up{}=0\`
+
+### Ingester / Writer
+- Write-ahead log (WAL) for durability before chunk write
+- In-memory chunks for last 2h; flushed to disk
+- Multi-tenant: tenant ID in series labels for isolation
+
+### Query Engine (PromQL)
+\`\`\`promql
+rate(http_requests_total{service="api", status=~"5.."}[5m])
+\`\`\`
+1. Lookup series matching the selector (label index)
+2. For each series, fetch points in window from chunks
+3. Apply function (rate, sum, avg)
+4. Return time series
+
+Query optimizations: parallelize across blocks; push down to storage; cache results.
+
+### Alerting
+- Recording rules: precompute expensive queries (e.g., per-service error rate)
+- Alerting rules: \`error_rate > 0.05 for 5m\`
+- Alertmanager: dedup, group, route to PagerDuty/Slack
+- Silences during maintenance windows
+
+### Long-term Storage
+- Cortex/Mimir/Thanos: ship blocks to S3
+- Compactor merges small blocks into larger (better compression)
+- Downsampler creates 5m, 1h aggregates for older data (raw not needed for years-old data)
+- Query engine fetches from S3 transparently for old data
+
+## Scaling Strategy
+- **Horizontal sharding** by tenant or by series hash
+- **Cortex/Mimir/Thanos** turn Prometheus into a horizontally scalable SaaS
+- **Read path scaling**: query frontend caches results; multiple queriers
+- **Write path scaling**: ingesters partitioned by series; replicated 3x for HA
+- **Object storage** for cheap long-term — same model as logs
+
+## Trade-offs & Bottlenecks
+- **Cardinality is the killer**: don't label by user_id, request_id, or any high-cardinality field. Each unique label combo = a new time series. Millions of series = slow queries + high RAM.
+- **Resolution vs cost**: 1-second resolution is luxury; 15s is plenty for most cases.
+- **Push vs pull tradeoffs**: pull is more reliable but harder for batch jobs. Most stacks support both.
+- **Bottleneck**: query memory for complex queries (high-cardinality, long range). Limit query duration; precompute via recording rules.
+
+## Follow-up Questions
+1. **Why not store metrics in Postgres?** TSDB has 10-100x better compression and query speed for time-series workloads. Postgres lacks Gorilla compression and label indices.
+2. **Histogram vs Summary?** Histogram: server-side bucketing (aggregable across instances). Summary: client-side quantile (more accurate but not aggregable). Prefer histograms.
+3. **How do percentiles work in distributed systems?** Can't average percentiles across instances. Use HDR histograms or t-digest for mergeable approximations.
+4. **What's a recording rule and why use it?** Pre-aggregate expensive queries: e.g., \`global_error_rate = sum(rate(errors)) / sum(rate(requests))\`. Stored as new series; dashboard reads from it.
+5. **InfluxDB vs Prometheus?** Influx: high-cardinality, push, SQL-ish query. Prom: pull, label-based, simpler. Different sweet spots.
+6. **Cost optimization?** Aggressive downsampling for old data; tier to S3; reduce cardinality (drop unused labels); ship to object store sooner.
+7. **How to detect anomalies automatically?** Statistical thresholds (3-sigma), seasonal decomposition, ML-based (Prophet, LSTM). Tradeoff: fewer false positives vs missed incidents.`,
+
+  'Design Code Deploy': `## Functional Requirements
+- Deploy a built artifact (Docker image, binary, package) to a fleet of servers
+- Support multiple environments: dev, staging, prod
+- Deployment strategies: rolling, blue-green, canary
+- Rollback to previous version with one command/click
+- Health checks during deployment
+- Audit log: who deployed what, when
+- Multi-region deployments
+
+## Non-Functional Requirements
+- **Scale**: 10K+ services, 100K+ deploys/day across the company
+- **Latency**: deploy a service in < 10 minutes (typical)
+- **Reliability**: failed deploys must not bring down service
+- **Auditability**: every deploy traceable
+- **Safety**: rollback must work even if normal deploy is broken
+
+## High-Level Architecture
+\`\`\`
+Developer
+  │
+  │  git push  →  CI  →  artifact (image)
+  ▼
+┌──────────────────────────┐
+│   Deployment Controller  │  ← API: "deploy image X to service Y"
+│   (Spinnaker/Argo CD)    │
+└──────────┬───────────────┘
+           │
+           ▼
+   ┌──────────────┐
+   │  State Store │  (etcd / Postgres)
+   │  - desired   │
+   │  - actual    │
+   └──────┬───────┘
+          │
+          ▼
+   ┌────────────────┐
+   │ Orchestrator   │ ◄── Reconciliation loop
+   │ (Kubernetes,   │
+   │  ECS, etc.)    │
+   └──────┬─────────┘
+          │
+          ▼
+   ┌────────────────┐
+   │  Worker Nodes  │
+   │  pull image,   │
+   │  run container │
+   └────────────────┘
+          │
+          ▼
+   ┌────────────────┐
+   │  Artifact      │
+   │  Registry      │  (ECR, Artifactory, GCR)
+   └────────────────┘
+\`\`\`
+
+## Core Concepts
+
+### Desired State vs Actual State
+- **Desired state**: declared by user (e.g., "service A should run image v1.2.3 with 100 replicas")
+- **Actual state**: what's currently running (continuously observed)
+- **Reconciliation loop**: orchestrator continuously diffs and converges
+
+This is Kubernetes' fundamental model. Imperative deployment scripts are antiquated.
+
+### Deployment Strategies
+
+**Rolling update**:
+- Replace instances N at a time (e.g., 10% per step)
+- Wait for new instances to be healthy before next batch
+- Rollback by reversing
+- Pros: simple, no extra capacity; Cons: mixed versions in production briefly
+
+**Blue-Green**:
+- Spin up new fleet (green) at full size alongside old (blue)
+- Switch load balancer when green ready
+- Keep blue around for quick rollback
+- Pros: instant rollback, no mixed versions; Cons: 2x capacity needed
+
+**Canary**:
+- Deploy new version to small % of traffic (1%, 5%, 50%, 100%)
+- Compare error rates / latency to baseline
+- Auto-rollback if metrics regress
+- Pros: real-traffic validation; Cons: needs traffic-splitting infra and metrics
+
+**Recommended**: rolling for boring services, canary for high-risk, blue-green for stateful.
+
+## Detailed Component Design
+
+### CI Pipeline
+- Build → Test → Push image to registry → Tag with commit SHA
+- Image immutable; never overwrite tags
+
+### Deployment Controller
+- Receives \`deploy(service, version, environment)\` request
+- Validates: image exists, user authorized, environment open
+- Updates desired state in etcd
+- Triggers orchestrator
+- Tracks deploy progress; emits events
+
+### Orchestrator Reconciliation
+- Watches desired state for changes
+- Computes diff: which pods to terminate, which to start
+- Applies in batches respecting strategy (rolling N% at a time)
+- Health checks new pods before proceeding
+- Handles failures: if pod fails to start, halts deploy and alerts
+
+### Health Checks
+- **Liveness**: is the process alive? (basic crash detection)
+- **Readiness**: ready to serve traffic? (warm-up complete)
+- **Startup**: initial readiness (longer timeout for slow-starting services)
+
+Deploy proceeds only when readiness probes pass.
+
+### Rollback
+- "Roll back" = re-deploy previous version
+- Must work even if config DB has bad state
+- Common pitfall: schema migrations that aren't backward-compat → rollback breaks DB
+- Solution: split schema changes from code changes; deploy schema first, code second; reverse for rollback
+
+## Multi-Region Deploy Pipeline
+\`\`\`
+Stage 1: Dev (auto on every commit)
+   ↓
+Stage 2: Staging (auto after dev passes)
+   ↓
+Stage 3: Canary in 1 region (1% traffic, 30 min soak)
+   ↓
+Stage 4: Region 1 full
+   ↓
+Stage 5: Region 2 (after Region 1 stable for 1h)
+   ↓
+Stage 6: Region 3 (and so on)
+\`\`\`
+Gates between stages: automated metrics check or human approval.
+
+## Scaling Strategy
+- **Stateless controller**: scale horizontally; uses etcd for state
+- **Per-cluster orchestrator**: each region/cluster has own K8s. Federation/Argo handles cross-cluster.
+- **Image registry**: replicated to each region (avoid cross-region pull at deploy time — slow)
+- **Concurrent deploys**: many services deploying simultaneously. Lock per service to prevent self-conflicts.
+
+## Trade-offs & Bottlenecks
+- **Speed vs safety**: every safety gate (canary soak, health waits) adds time. Tradeoff per service criticality.
+- **Mixed versions**: rolling deploys briefly run two versions. Code must be backward-compatible (schema, API contracts).
+- **Stateful services**: harder. Persistent volumes, leadership transitions, schema migrations require care. Avoid blue-green for these.
+- **Bottleneck**: image pull. Large images on slow networks bog down nodes. Pre-pull on nodes; use slim images.
+- **Configuration drift**: out-of-band changes break the "desired = actual" model. Lock down direct cluster access.
+
+## Follow-up Questions
+1. **What if a deploy fails halfway?** Auto-pause; service has mixed versions briefly. Operator triggers rollback or fix-forward.
+2. **How does Spinnaker compare to Argo CD?** Spinnaker: imperative pipelines, multi-cloud, mature. Argo: GitOps, K8s-native, declarative. Argo is the modern default.
+3. **GitOps philosophy?** Git is source of truth for desired state. Operators reconcile actual to git. PR review = deploy review.
+4. **How to roll out database schema changes?** Two-phase: 1) deploy schema change additive (new column nullable), 2) deploy code using it, 3) optionally remove old column. Never drop in same deploy.
+5. **What's a feature flag and how does it relate?** Decouples deploy from release. Code deployed dark; feature toggled on for cohorts. Rollback is a flag flip, not a redeploy.
+6. **How do you deploy a fix when CI is broken?** Hotfix pipeline: same controls, faster path. Or pre-built emergency images.
+7. **Cross-region failure during deploy?** Stop the rollout. Use region-aware deploy: deploy to one region, soak, then proceed. Never global-rollout simultaneously.`,
+
+  'Design Food Delivery': `## Functional Requirements
+- Browse restaurants near user; menus
+- Place order; pay
+- Restaurant accepts/rejects/preps order
+- Assign delivery agent; track in real-time
+- Rating, reviews
+- Coupons, surge pricing
+- Multi-restaurant orders (some apps)
+
+## Non-Functional Requirements
+- **Scale**: 50M users, 5M orders/day, 1M active restaurants
+- **Latency**: order placement < 1s; map updates every 5s
+- **Geo-aware**: nearby search, agent dispatch
+- **Availability**: 99.95% — peak meals (lunch, dinner) cannot fail
+- **Reliability**: orders must not be lost; payment exactly once
+
+## Capacity Estimation
+\`\`\`
+Orders/day:    5M  → ~60/sec average, ~500/sec at lunch peak
+Active agents: 200K riders globally
+Location updates: 200K × every 5s = 40K writes/sec
+Storage:       ~10KB per order × 5M/day × 1yr = ~18 TB
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Customer App / Restaurant App / Delivery App
+                │
+                ▼
+       ┌────────────────┐
+       │  API Gateway   │
+       └────┬───────┬───┴───────────┐
+            │       │               │
+            ▼       ▼               ▼
+   ┌──────────┐┌──────────┐┌─────────────┐
+   │Restaurant││  Order   ││  Dispatch   │
+   │  Search  ││ Service  ││  Service    │
+   └────┬─────┘└────┬─────┘└──────┬──────┘
+        │           │              │
+        ▼           ▼              ▼
+   ┌──────────┐┌──────────┐┌─────────────┐
+   │ Geo-Index││ Postgres ││  Geo-Index  │
+   │ (rest.)  ││ (orders) ││  (agents)   │
+   │  Redis   ││          ││  Redis      │
+   └──────────┘└─────┬────┘└─────────────┘
+                     │
+                     ▼
+              ┌──────────────┐
+              │ Payment Svc  │ → Stripe
+              └──────────────┘
+                     │
+                     ▼
+              ┌──────────────┐
+              │Notification  │
+              │ Service      │
+              └──────────────┘
+\`\`\`
+
+## Database Schema
+\`\`\`
+restaurants
+  id, name, location (lat, lng), cuisine_type[], rating, status (open|closed)
+
+menu_items
+  id, restaurant_id, name, price, image_url, category, available
+
+orders (Postgres)
+  order_id, user_id, restaurant_id, items[] (with price snapshot),
+  total, status, created_at, delivered_at, agent_id, delivery_address
+
+order_status_history (audit log)
+  order_id, status, timestamp, actor
+
+agents
+  agent_id, name, vehicle_type, current_location, status (off|free|on_trip)
+
+agent_locations (Redis Geo)
+  GEOADD agents:cell_xyz lng lat agent_id
+
+reviews (Cassandra)
+  restaurant_id, user_id, order_id, rating, text, created_at
+\`\`\`
+
+## Detailed Component Design
+
+### Restaurant Search
+- Restaurants indexed by location (Redis Geo / S2 cells)
+- Filter: cuisine, dietary, rating, open-now
+- Ranking: distance × rating × delivery time × promotion boost
+- Caching: top results per neighborhood × cuisine combo cached for 60s
+
+### Order Lifecycle
+\`\`\`
+Created → Paid → Restaurant_Accepted → Preparing → 
+Agent_Assigned → Picked_Up → In_Transit → Delivered
+                                              ↓
+                                          Reviewed
+\`\`\`
+Each transition logged; some require timeout handling (e.g., restaurant doesn't accept in 5 min → auto-cancel).
+
+### Payment Integration (critical path)
+- Idempotency key per order
+- Authorize on order placement; capture on restaurant acceptance
+- Failure modes: pre-auth failed → reject order; capture failed → retry with backoff
+- Refunds via separate flow on cancellation
+
+### Dispatch (the hard part)
+**Goal**: minimize delivery time and cost; maximize agent utilization.
+
+**Approach 1: Greedy nearest agent**
+- Find free agents within radius
+- Assign closest one
+- Simple but ignores upcoming orders
+
+**Approach 2: Batched optimization**
+- Run dispatch every 10-15 sec
+- Consider all pending orders + free agents simultaneously
+- Solve assignment problem (Hungarian algorithm or heuristic) minimizing total ETA
+- Allow batching (one agent picks 2 orders from same restaurant going same direction)
+
+**Approach 3: Predictive**
+- Pre-position agents in high-demand areas (downtown at lunch)
+- ML predicts demand 30 min ahead
+
+Real-world dispatch combines all three.
+
+### Real-time Tracking
+- Agent app sends GPS every 5s over WebSocket
+- Server pushes updates to customer app (also WebSocket)
+- ETA recalculated using current location + traffic + restaurant prep status
+
+### Restaurant Operations
+- Tablet app for restaurants: order list, accept/reject button
+- Audio + visual alerts on new order
+- Marks ready → triggers dispatch
+
+## Surge Pricing
+- Demand/supply ratio per zone, computed every minute
+- Triggers customer-facing fee bump and agent-facing pay bump
+- Smooths demand peaks; brings more agents online
+
+## Scaling Strategy
+- **Geo-partitioning**: one stack per city/region; minimal cross-region traffic
+- **Read-heavy**: cache restaurant data, menus aggressively (5-min TTL)
+- **Write-heavy**: orders + location updates. Cassandra for orders (sharded by id); Redis for locations
+- **Stateless services**: easy to scale horizontally
+- **Async events**: order events to Kafka → consumed by notifications, analytics, ML
+
+## Trade-offs & Bottlenecks
+- **Search ranking**: every signal makes it more relevant but slower. Cache aggressively.
+- **Dispatch latency**: longer optimization batches = better assignments but slower customer experience. Tune per market.
+- **Payment ↔ order consistency**: critical. Use saga pattern: order saga has compensation step (refund) on failure.
+- **Bottleneck**: peak-hour dispatcher load. 1M orders globally at lunch = many simultaneous dispatch decisions. Sharded by city helps.
+- **Edge case**: restaurant rejects after agent assigned. Dispatcher unassigns; order may be reassigned to different restaurant or refunded.
+
+## Follow-up Questions
+1. **How to predict prep time?** ML on past orders × restaurant × current load × menu items. Updated continuously.
+2. **What if delivery agent disappears mid-trip?** Detect via location heartbeat. Reassign order. Compensate customer.
+3. **Multi-restaurant orders (Uber Eats Combine)?** Pickup from multiple restaurants en route. Complex routing; only viable for adjacent restaurants.
+4. **Surge fairness?** Cap multiplier; communicate clearly. Loyalty users sometimes excluded.
+5. **Fraud detection?** Detect: fake orders (test cards), GPS spoofing, agent-customer collusion. ML on patterns; manual review for flagged.
+6. **What about restaurant onboarding?** Self-service with verification (license, food safety). KYC for owner. Approval before going live.
+7. **Cold storage / scheduled orders?** Orders placed for future delivery time. Stored separately; queued into dispatch system at appropriate time before delivery.`,
+
+  'Design Dropbox': `## Functional Requirements
+- Sync files across multiple devices for one user
+- Upload/download files
+- Share files/folders with other users
+- Version history
+- Conflict resolution for concurrent edits
+- Selective sync (only some folders to a device)
+- Smart sync (placeholder files, fetch on access)
+
+## Non-Functional Requirements
+- **Scale**: 700M users, ~500B files, exabytes stored
+- **Latency**: sync change to other devices < 30 sec
+- **Bandwidth efficiency**: only re-transmit changed bytes
+- **Durability**: 11 nines — no file should ever be lost
+- **Offline support**: edit offline, sync on reconnect
+
+## Capacity Estimation
+\`\`\`
+Avg storage per user:  ~10 GB
+Total:                  700M × 10 GB = 7 EB
+Files modified/day:     billions
+Block-level dedup:      ~2x reduction across users → ~3.5 EB usable storage
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Desktop Client / Mobile / Web
+    │
+    │  Notification (long-poll / WebSocket)
+    ▼
+┌──────────────────────────┐
+│  Notification Service     │ ← tells clients "something changed"
+└──────────┬───────────────┘
+           │
+           ▼
+┌──────────────────────────┐
+│  Metadata Service         │
+│  - file/folder tree       │
+│  - block hashes           │
+│  - permissions            │
+│  - version history        │
+└──────────┬───────────────┘
+           │
+           ▼
+   ┌──────────────┐
+   │  Postgres    │  (sharded by user_id)
+   └──────────────┘
+           
+   ┌──────────────┐
+   │ Block Storage│  (S3-equivalent, content-addressable)
+   └──────────────┘  ← key = sha256(block); value = bytes
+\`\`\`
+
+## Core Insight: Block-Level Sync + Content-Addressable Storage
+
+**Files split into 4MB blocks**. Each block hashed (SHA-256). 
+**Storage indexed by hash** — same block stored once globally (with multi-tenant safety).
+
+\`\`\`
+report.pdf (12 MB):
+  Block 1 (0-4MB):  hash=abc123
+  Block 2 (4-8MB):  hash=def456
+  Block 3 (8-12MB): hash=ghi789
+
+If user edits middle of file → only Block 2 changes → only Block 2 re-uploads.
+\`\`\`
+
+## Sync Algorithm
+
+**Each client maintains**:
+- Local file tree
+- Last synced version (per file)
+- "Cursor" — points to latest server event the client has consumed
+
+**Server maintains per-user event log**:
+\`\`\`
+event_id | type     | path        | block_hashes | timestamp
+1001     | created  | /a.txt      | [h1, h2]     | t1
+1002     | modified | /a.txt      | [h1, h3]     | t2
+1003     | deleted  | /old.pdf    | -            | t3
+\`\`\`
+
+**Sync flow**:
+1. Client: \`GET /events?cursor=1000\` → server returns all events since 1000
+2. Client applies changes locally; updates cursor
+3. Client uploads its own changes: hash blocks, send only missing ones
+4. Server updates event log; notifies other devices via long-poll/WebSocket
+
+## Detailed Component Design
+
+### Upload (delta sync)
+1. Client computes per-block hashes of new file version
+2. Sends hash list to server: "I want to upload these blocks"
+3. Server replies: "you already have h1, h2; upload h3, h4"
+4. Client uploads only missing blocks → S3 with pre-signed URLs
+5. Client sends "commit": "file X now consists of blocks [h1, h2, h3, h4]"
+6. Server updates metadata; emits sync event
+
+### Download
+1. Client gets event with new file version + block list
+2. Looks up which blocks it doesn't have locally
+3. Downloads only missing blocks
+4. Reassembles file
+
+### Conflict Resolution
+- Two clients edit same file offline
+- Both come online; both push new versions
+- First push wins; second receives "conflict" → creates "filename (Conflicted copy from User's MacBook).txt"
+- User resolves manually
+- Trade-off: complex CRDT-based merging is expensive; simple "create copy" is bulletproof
+
+### Version History
+- Every modify creates new entry in versions table
+- Old block lists kept for ~30 days (or longer for paid plans)
+- Restore: re-link file to previous block list — instant (no re-upload needed)
+
+### Selective Sync
+- Client UI lets user pick folders to sync to this device
+- Only events for synced folders processed
+- Smart Sync: store placeholders (icon + size) instead of full files; fetch on open
+
+### Sharing
+- Shared folder = root + permission grants
+- Permissions stored in metadata DB
+- On share, recipient's event log gets the folder events
+- Cross-user permission check on every metadata access
+
+## Database Schema
+\`\`\`
+files (Postgres, partition: user_id)
+  file_id, user_id, path, name, size, blocks[],
+  current_version, modified_at, deleted_at?
+
+events (per-user log; sharded)
+  event_id, user_id, type, file_id, ...
+
+blocks (object storage; key = hash)
+  → bytes (content-addressed)
+
+shares
+  share_id, owner_id, target (user/group/link), role,
+  created_at
+
+devices
+  device_id, user_id, last_seen_at, sync_cursor
+\`\`\`
+
+## Scaling Strategy
+- **Metadata sharded by user_id** — most operations are user-local
+- **Object storage handles bytes** — scales independently
+- **Event log per user** — fits in user's shard, simplifies consistency
+- **Long-poll for change notification**: server holds connection ~30s; releases when event arrives
+- **Block dedup pool**: server-side dedup across all users (with safety: server cannot infer content from existence — key is hash + per-user salt for security-conscious deployments)
+
+## Trade-offs & Bottlenecks
+- **Dedup vs encryption**: client-side encryption breaks cross-user dedup. Dropbox uses server-side keys; encrypted-at-rest but not E2EE.
+- **Mobile bandwidth**: aggressive batching; defer big downloads to Wi-Fi
+- **Conflict UX**: file-level conflict (rename) is honest but cluttered. Doc-level merging requires Doc-aware service.
+- **Bottleneck**: metadata DB writes during folder share with 10K files. Batch + throttle.
+- **Cost**: storage dominant. Tier rarely-accessed files to cold storage. Encourage cleanup.
+
+## Follow-up Questions
+1. **How does delta sync compute bytes to send?** Per-block hashing comparison. For very large files, sub-block diffs (rolling hash like rsync) — but Dropbox uses fixed blocks for simplicity.
+2. **What if a block is corrupted in storage?** Verify hash on read; storage layer (S3) provides 11-9s durability via erasure coding. Fallback: rebuild from replica.
+3. **End-to-end encryption?** Boxcryptor / Cryptomator add E2EE on top, but break dedup, search, web preview. Trade-off: privacy vs feature richness.
+4. **How does sharing scale?** Shared folder permissions checked on access; cached in Redis. Inherited folder permissions via materialized path.
+5. **What about real-time co-editing (paper docs)?** Separate document service with CRDT; persists snapshots to Dropbox blob. Same model as Google Docs.
+6. **Mobile selective sync?** Smart Sync stores placeholders (file metadata only); fetches bytes on open. Saves device storage massively.
+7. **How to detect if a user is hoarding pirated content?** Hash matching against known pirated content databases (DMCA takedown). On match, block sharing; tombstone file.`,
+
+  'Design Ticket Booking': `## Functional Requirements
+- Browse events (movies, concerts, sports)
+- View seat map; pick seats
+- Reserve seats temporarily (hold during checkout, ~10 min)
+- Pay; confirm booking
+- Generate ticket (QR code); send to email/SMS
+- Cancel/refund
+- Admin: create events, set pricing
+
+## Non-Functional Requirements
+- **Scale**: 100M users, 10M tickets/day
+- **Concurrency**: massive bursts when popular events open (BTS tickets) — 1M users hitting one event in seconds
+- **Consistency**: STRONG — never sell same seat twice
+- **Latency**: < 500ms seat selection; < 2s checkout
+- **Availability**: 99.95% — popular sales must not fail
+
+## The Hard Problem: Hot Events
+Most of the time, this looks like a normal CRUD app. But popular events (Taylor Swift, World Cup) create extreme bursts:
+- 1M users refreshing simultaneously when sale opens
+- Only 50K seats available
+- Must not double-book
+- Must be fair
+
+This drives the entire architecture.
+
+## High-Level Architecture
+\`\`\`
+   Client
+     │
+     ▼
+┌────────────────┐
+│ Virtual Waiting│  ← throttle frontline before backend
+│   Room (CDN)   │
+└──────┬─────────┘
+       │ admit N users/sec
+       ▼
+┌────────────────┐
+│  API Gateway   │
+└──────┬─────────┘
+       │
+   ┌───┼─────────────┬──────────────┐
+   ▼   ▼             ▼              ▼
+┌─────┐┌─────────┐┌──────────┐┌───────────┐
+│Event││ Seat    ││ Booking  ││ Payment   │
+│Catlg││ Inv-    ││ Service  ││  Service  │
+│     ││ entory  ││           ││           │
+└──┬──┘└────┬────┘└────┬─────┘└──────┬────┘
+   │        │           │             │
+   ▼        ▼           ▼             ▼
+┌────────┐┌──────┐ ┌────────┐  ┌──────────┐
+│Postgres││Redis │ │Postgres│  │  Stripe  │
+│(events)││(seat │ │(books) │  └──────────┘
+│        ││ holds)│ │         │
+└────────┘└──────┘ └────────┘
+\`\`\`
+
+## Database Schema
+\`\`\`sql
+events
+  event_id, name, venue_id, starts_at, sale_opens_at, status
+
+venues
+  venue_id, name, location, total_capacity, layout (sections, rows, seats)
+
+seats
+  seat_id, event_id, section, row, seat_num, price, status
+  (status: available | held | sold | reserved_by_admin)
+  PARTITION BY event_id  -- so all seats for one event are colocated
+
+seat_holds (Redis)
+  Key: hold:{event_id}:{seat_id}
+  Value: {user_id, expires_at}
+  TTL: 600 sec (10-min hold)
+
+bookings (Postgres)
+  booking_id, user_id, event_id, seat_ids[], total_paid,
+  status (confirmed | refunded | cancelled), payment_id, created_at
+
+payments
+  payment_id, booking_id, amount, provider_ref, status
+\`\`\`
+
+## Detailed Component Design
+
+### Seat Hold (the critical operation)
+**Naive**: \`UPDATE seats SET status='held', held_by=? WHERE seat_id=? AND status='available'\`
+- Works but at 1M concurrent users, lock contention destroys Postgres
+
+**Better: Redis with atomic ops**
+\`\`\`
+SET hold:{event_id}:{seat_id} {user_id} NX EX 600
+  → if response is OK: hold acquired
+  → if nil: someone else holds it
+\`\`\`
+- Atomic; no lock contention; sub-ms latency
+- Postgres updated async (\`held_by\`) for audit
+- On TTL expiry, hold auto-releases — seat becomes available
+
+**Even better: pre-load seat inventory into Redis**
+- For each hot event, load all seat IDs into Redis as a sorted set or hash
+- Available seats: \`SADD seats:{event_id}:available seat1 seat2 ...\`
+- Hold: \`SMOVE seats:{event_id}:available seats:{event_id}:held seat1\` (atomic move)
+
+### Virtual Waiting Room
+For massively hot sales:
+- All users hit a CDN-served waiting page first
+- Waiting page polls API: "is it my turn yet?"
+- Backend admits N users/sec (e.g., 100/sec)
+- Admitted users get a token; can proceed to seat selection
+- Prevents stampede on backend; users see fair queue position
+
+### Checkout Flow
+1. User picks seats → seat hold acquired (Redis)
+2. User goes to payment page; 10-min timer ticks
+3. User submits payment → Payment Service charges via Stripe
+4. On payment success:
+   - Convert held seats to sold (Redis SREM, Postgres UPDATE)
+   - Create booking record
+   - Generate QR ticket
+   - Send confirmation email
+5. On payment failure or timeout:
+   - Hold expires automatically
+   - Seats return to available pool
+
+### Saga Pattern for Booking
+\`\`\`
+1. Hold seats              → on fail: abort
+2. Charge payment          → on fail: release hold
+3. Create booking record   → on fail: refund + release
+4. Send confirmation       → on fail: log; user can re-fetch
+\`\`\`
+Compensating transactions undo earlier steps on later failure. Idempotency keys throughout.
+
+### Ticket Generation
+- Booking ID + seat ID + event ID + signature → QR code
+- HMAC signature prevents forgery
+- At venue: scanner verifies signature, marks ticket as used (one-time)
+
+## Scaling Strategy
+- **Per-event Redis instance** for hot events: isolation prevents one popular event from impacting others
+- **Read-heavy event browsing**: cache event details, seat maps for 1 min
+- **Sharding bookings table** by event_id (recent events frequently queried)
+- **Payment isolation**: payment service rate-limits to Stripe; queues if needed
+- **Static seat maps on CDN**: SVG with seat positions; client overlays availability via API
+
+## Trade-offs & Bottlenecks
+- **Strong consistency required**: can't oversell. Redis atomic ops + Postgres durability.
+- **Hold duration**: 10 min is balance between user UX (time to pay) and inventory turnover (slow holds delay sales)
+- **Fair queueing vs throughput**: virtual waiting room slows everyone down but prevents chaos
+- **Bottleneck**: Stripe API rate limit. Pre-buy capacity for hot sales; queue and inform user of "processing" state.
+- **Refund handling**: cancellation 24h+ before event = full refund; closer = partial. Async refund processing.
+
+## Follow-up Questions
+1. **What about resale / secondary market?** Separate marketplace flow. Original ticket invalidated; new QR generated for buyer. Anti-scalper: cap resale price; tie ticket to ID.
+2. **Best seat suggestion?** Offer "best available" button. Algorithm: closest to stage, center of row, no obstructions, within budget.
+3. **How to prevent bot purchases?** CAPTCHA, device fingerprinting, payment method limits per user, rate limits, ML behavioral models.
+4. **What if Redis goes down during a hot sale?** Disaster. Have replica with automatic failover. Backed by Postgres for source-of-truth recovery.
+5. **Group bookings (10+ tickets)?** Special path; reserve seats in same row contiguously. May require admin assistance for very large groups.
+6. **Subscription/season tickets?** Bulk reservation; user owns recurring seat. Different data model.
+7. **Disability access seats?** Marked separately in seat map; only shown to users who select accessibility option. Compliance with ADA.`,
+
+  'Design Yelp': `## Functional Requirements
+- Search businesses near a location (restaurants, services)
+- Filter by category, rating, price, hours
+- View business details: photos, hours, menu, reviews
+- Post reviews with photos
+- User accounts, friends, check-ins
+- Business owner accounts; respond to reviews
+- Recommendations
+
+## Non-Functional Requirements
+- **Scale**: 100M MAU, 200M+ reviews, 10M+ businesses
+- **Latency**: search < 200ms; business page < 300ms
+- **Read-heavy**: ~1000:1 read:write ratio
+- **Geo-aware**: every search is location-bound
+- **Availability**: 99.9%
+
+## Capacity Estimation
+\`\`\`
+Search QPS:    100M users × 5 searches/day = 500M/day → ~6K/sec avg, ~25K peak
+Reviews/day:   1M new
+Storage:       ~5KB/business, ~2KB/review → 50GB businesses + 400GB reviews/yr
+Photos:        50PB+ (CDN)
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Client
+  │
+  ▼
+┌────────────┐
+│API Gateway │
+└─────┬──────┘
+      │
+   ┌──┼──────────┬─────────┬──────────┐
+   ▼  ▼          ▼         ▼          ▼
+┌────┐┌──────┐┌──────┐ ┌──────┐ ┌──────────┐
+│Biz ││Search││Review│ │Photo │ │Recommend │
+│Svc ││ Svc  ││ Svc  │ │ Svc  │ │ Service  │
+└─┬──┘└──┬───┘└──┬───┘ └──┬───┘ └────┬─────┘
+  │      │        │         │           │
+  ▼      ▼        ▼         ▼           ▼
+┌────┐┌──────────┐┌──────┐┌──────┐┌──────────┐
+│PG  ││Elasticsrch││Cass. ││ S3   ││ ML Models│
+│(biz││+geo index ││(rev) ││+CDN  ││(re-rank) │
+└────┘└──────────┘└──────┘└──────┘└──────────┘
+\`\`\`
+
+## Database Schema
+\`\`\`
+businesses (Postgres + Elasticsearch index)
+  business_id, name, location (lat, lng), address, categories[],
+  hours (per day), price_tier, rating_avg, review_count, photos[]
+
+reviews (Cassandra, partition: business_id)
+  review_id, business_id, user_id, rating (1-5), text,
+  photos[], created_at, helpful_count
+
+users
+  user_id, name, profile_pic, friend_count
+
+user_friends (Cassandra)
+  user_id (partition), friend_id
+
+check_ins (Cassandra)
+  user_id, business_id, checked_in_at, photo?
+
+photos (S3 + DynamoDB metadata)
+  photo_id, owner_id, business_id?, url, caption, created_at
+\`\`\`
+
+## Detailed Component Design
+
+### Geospatial Search
+**Approach 1: Bounding box in Postgres**
+\`\`\`sql
+SELECT * FROM businesses 
+WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?
+\`\`\`
+Works but slow with millions of businesses + filters.
+
+**Approach 2: PostGIS or Elasticsearch geo index**
+- Geohash or R-tree index
+- Query: "within 5km of (lat, lng) AND category=restaurant AND rating>=4"
+- Sub-100ms even at scale
+- Elasticsearch is the de facto choice for combined geo + text + facet search
+
+### Search Flow
+1. User searches "pizza near me"
+2. Client sends location + query + filters
+3. ES query: \`geo_distance(5km) AND category="pizza" AND open_now=true\`
+4. Result: top 100 candidates by relevance score
+5. ML re-ranker scores using user features (taste embedding) and business features (recency-weighted rating, popularity)
+6. Top 20 returned
+
+### Review Submission
+1. User writes review (rating + text + photos)
+2. Photos uploaded directly to S3 (pre-signed URLs)
+3. Review record written to Cassandra
+4. Async pipeline:
+   - Update aggregate rating (CAS-based or eventual)
+   - Spam/quality classifier (filter or hide)
+   - Index in Elasticsearch (for review search)
+   - Notify business owner
+   - Update recommendations
+
+### Aggregate Ratings
+**Naive**: read all reviews on every business page load → too slow.
+**Solution**: denormalized counter per business — \`rating_avg\`, \`review_count\` in businesses table.
+
+**Update strategies**:
+- **On every review write**: simple, immediate, but contention on hot businesses
+- **Batch async**: Kafka stream → recompute periodically (every 5 min for active businesses)
+- **Approximate**: streaming algorithm (Welford's online mean) updates counter atomically
+
+### Spam Detection
+Reviews are gamed heavily. Defense layers:
+- Rate limit reviews per user
+- Spam classifier (ML on text + metadata)
+- Hide suspicious reviews from main feed; show in "filtered" section
+- Detect review-buying patterns (bursts, network analysis)
+- Verify user authenticity (phone, photo of receipt)
+
+### Personalization
+- User taste profile: vectors of preferred cuisines, price tiers, attributes
+- Build from review history, check-ins, search clicks
+- Re-rank search results: same restaurant scored higher for users who like its cuisine
+- "You might like" recommendations: collaborative filtering on user-business matrix
+
+## Scaling Strategy
+- **Read-heavy**: cache business details (Redis, 5-min TTL); CDN for photos
+- **Search at scale**: ES cluster with index sharding by region; multi-region clusters
+- **Reviews**: Cassandra scales horizontally; partition by business
+- **Photos**: S3 + multi-region CDN
+- **Aggregations**: pre-computed offline (popular searches, trending lists)
+
+## Trade-offs & Bottlenecks
+- **Search relevance vs latency**: more ranking signals = better results but slower. Cache top results per query+geo cell.
+- **Review consistency**: aggregate rating may lag for a few minutes after new review. Acceptable.
+- **Hot business**: a viral restaurant gets million views on its page. Cache aggressively; expand replication.
+- **Bottleneck**: photo upload bandwidth during peak. Direct-to-S3 uploads; never through app servers.
+- **Spam economy**: cat-and-mouse. Continuous investment in ML defenders. Some reviews always slip through.
+
+## Follow-up Questions
+1. **How does ranking handle new businesses (cold start)?** Boost newer businesses initially; collect signals; converge to long-term rank. "New" badge attracts curious users.
+2. **What about restaurant recommendations across cities?** Different model: travel intent. Use prior reviews from similar cuisines or cities user visited.
+3. **Photo moderation?** ML for inappropriate content (NSFW, off-topic). Manual review queue for borderline. Owner can flag.
+4. **Owner responses to reviews?** Special user role. Stored as \`response\` field on review. Notification to original reviewer.
+5. **How to detect a fake business listing?** Verify via mailed postcard with code, phone call. Manual review for high-fraud categories.
+6. **Trending businesses?** Window-based: views/check-ins this week vs baseline. Surface in "Hot now" section.
+7. **Reservations integration (e.g., OpenTable)?** Embed third-party booking widget. Pass-through to OpenTable API. Track conversions but don't own reservation.`,
+
+  'Design Hotel Booking': `## Functional Requirements
+- Search hotels by location, dates, guests
+- View hotel details, photos, room types
+- Book a room (specific dates)
+- Pay; receive confirmation
+- Modify/cancel reservation per policy
+- Loyalty programs, discounts
+- Hotel admin: manage inventory, prices, availability
+
+## Non-Functional Requirements
+- **Scale**: 1M+ hotels, 100M+ users, 5M bookings/day
+- **Consistency**: STRONG — never overbook
+- **Latency**: search < 500ms; booking < 2s
+- **Date arithmetic**: complex (overlapping ranges, partial nights)
+- **Availability**: 99.95% — high-value transactions
+
+## Capacity Estimation
+\`\`\`
+Searches/day:    1B   → ~12K/sec, ~40K peak
+Bookings/day:    5M   → ~60/sec, ~300 peak
+Hotel rooms:     1M hotels × avg 100 rooms = 100M rooms
+Date slots/yr:   100M × 365 = 36B inventory cells (date × room)
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Client
+  │
+  ▼
+┌────────────┐
+│API Gateway │
+└─────┬──────┘
+      │
+   ┌──┼──────────┬──────────┬───────────┐
+   ▼  ▼          ▼          ▼           ▼
+┌────┐┌────────┐┌──────────┐┌──────────┐┌────────┐
+│Hotel││Search  ││Inventory ││ Booking  ││Pricing │
+│ Svc ││ Svc    ││ Service  ││ Service  ││ Svc    │
+└──┬──┘└──┬─────┘└────┬─────┘└────┬─────┘└────┬───┘
+   │      │             │           │          │
+   ▼      ▼             ▼           ▼          ▼
+┌────┐┌──────────┐ ┌─────────┐┌────────┐┌──────────┐
+│PG  ││ Elastic   │ │Postgres ││Postgres││ ML Models│
+│hot ││ + geo     │ │(invent. ││(books) ││(dynamic  │
+│els ││ index     │ │ + locks)││+payment││ pricing) │
+└────┘└──────────┘ └─────────┘└────────┘└──────────┘
+\`\`\`
+
+## Database Schema
+\`\`\`
+hotels
+  hotel_id, name, location, star_rating, amenities[], description, photos[]
+
+room_types
+  room_type_id, hotel_id, name (Deluxe King, etc.),
+  base_price, capacity, total_rooms
+
+inventory (per room_type per date)
+  hotel_id, room_type_id, date, available_count, price_today
+  PRIMARY KEY (hotel_id, room_type_id, date)
+  -- Decrement available_count on booking; date-based partition
+
+bookings
+  booking_id, user_id, hotel_id, room_type_id,
+  check_in, check_out, num_guests, total_paid,
+  status (confirmed | cancelled), created_at
+
+booking_items (per night)
+  booking_id, date, room_type_id, price_paid
+\`\`\`
+
+## Core Hard Problem: Concurrent Booking
+
+Two users both try to book the last room at the same hotel for the same date.
+
+**Solution: row-level lock on inventory**
+\`\`\`sql
+BEGIN;
+SELECT available_count FROM inventory
+  WHERE hotel_id=? AND room_type_id=? AND date BETWEEN ? AND ?
+  FOR UPDATE;  -- locks rows
+-- check all dates have availability
+UPDATE inventory SET available_count = available_count - 1
+  WHERE hotel_id=? AND room_type_id=? AND date BETWEEN ? AND ?;
+INSERT INTO bookings (...) VALUES (...);
+COMMIT;
+\`\`\`
+- All-or-nothing: either booking succeeds for all dates or none
+- Locks held only briefly (one row per night × ~3-7 nights typical)
+- Throughput sufficient for 300 bookings/sec at peak
+
+For higher concurrency: Redis-based holds (similar to ticket booking) with eventual sync to Postgres.
+
+## Detailed Component Design
+
+### Hotel Search
+**Inputs**: location, check-in date, check-out date, # guests, filters
+
+**Steps**:
+1. Geo-search via Elasticsearch: hotels within radius
+2. For each candidate (hundreds): query inventory for date range — must have availability for ALL nights
+3. Filter by amenities, rating, price range
+4. ML re-rank by user preferences, conversion likelihood, business priority
+5. Return top 50
+
+**Performance optimization**: 
+- Inventory cache (Redis) keyed by (hotel_id, date) for fast lookup
+- For long stays, query lower bound of availability across nights → skip hotel if any night sold out
+
+### Booking Flow (saga)
+\`\`\`
+1. Reserve inventory (decrement counts in transaction) → on fail: room unavailable
+2. Charge payment via Stripe                          → on fail: re-increment inventory
+3. Create booking record                              → on fail: refund + re-increment
+4. Send confirmation email                            → on fail: log; user can re-fetch
+\`\`\`
+Idempotency keys ensure safe retries.
+
+### Cancellation
+- Look up booking, validate cancellation policy
+- If within free-cancel window: refund full → release inventory
+- Else: refund partial per policy → release inventory
+- Inventory released = increment available_count for those dates
+
+### Dynamic Pricing
+- Hotels increase price as availability dwindles, decrease near date if rooms unsold
+- ML model: input (current occupancy, days until check-in, day of week, local events, comparable rates)
+- Pricing service updates inventory.price_today periodically (hourly)
+- "Lock-in" mechanism: search returns price snapshot; booking honors it for ~10 min
+
+### Inventory Sync with PMS
+- Hotels often manage inventory via Property Management Systems (Opera, Cloudbeds)
+- Channel manager sync: pull/push availability and prices
+- Two-way sync prevents overbooking when same room sold via multiple platforms
+- Real-time updates via webhooks or polling
+
+## Scaling Strategy
+- **Sharded inventory** by hotel_id — most queries are hotel-local
+- **Search via Elasticsearch** with geo + date facet pre-aggregation
+- **Cache popular searches** (top destinations × common date ranges) for 5 min
+- **Read replicas** for search; writes to primary for inventory
+- **Pre-warm cache** for upcoming high-demand destinations (NYE, summer)
+
+## Trade-offs & Bottlenecks
+- **Inventory consistency vs throughput**: row locks limit concurrent bookings but ensure correctness. For luxury one-of-a-kind suites, even more conservative.
+- **Search complexity**: more filters = slower. Pre-compute common combinations.
+- **Pricing freshness**: prices change continuously; cache for too long → stale; too short → cache miss every search. ~5 min sweet spot.
+- **Bottleneck**: Stripe API for payment. Pre-arrange volume; queue with backoff.
+- **Multi-currency**: convert at search; lock currency at booking. Hedging financial risk.
+
+## Follow-up Questions
+1. **What about overbooking on purpose?** Hotels intentionally overbook ~5% (anticipating no-shows). Algorithm: predict no-show rate; oversell within tolerance. On overbook, walk guest to comparable hotel + comp.
+2. **Group bookings (corporate, weddings)?** Negotiated rates, block-of-rooms reservations. Different table; locked for the buyer until release date.
+3. **Loyalty integration?** Member rates, free upgrades, points earned/spent. User table has loyalty_status; rules apply at search/booking.
+4. **Multi-night with different room types?** Less common, but supported: separate booking_items per night.
+5. **Photos and content management?** S3 + CDN. Hotel admins upload via portal; moderation queue.
+6. **Cancellation refund timing?** Process via Stripe API; takes 5-10 days to appear on card. Communicate clearly.
+7. **Why are search APIs from Booking/Expedia so slow sometimes?** They aggregate from hundreds of hotel APIs — many with their own latency. Cache aggressively; show partial results progressively.`,
+
+  'Design Online Judge': `## Functional Requirements
+- Show coding problems with descriptions and test cases
+- Submit code in multiple languages (Python, C++, Java, etc.)
+- Run code in isolated environment against hidden test cases
+- Return verdict: AC, WA, TLE, MLE, RE, CE
+- Leaderboards, contests
+- Editorials, discussions
+
+## Non-Functional Requirements
+- **Scale**: 10M users, 1M submissions/day, 100K during contests
+- **Latency**: judge in < 5s for typical solution
+- **Security**: untrusted code MUST be sandboxed (no escape, no DoS)
+- **Fairness**: deterministic execution time; no flaky verdicts
+- **Availability**: 99.9%; contests are time-bound — cannot fail
+
+## Capacity Estimation
+\`\`\`
+Submissions/day:    1M average → ~12/sec; contest peak ~1000/sec
+Judge time/sub:     2-10 sec
+Concurrent judges:  ~1000 needed at contest peak
+Storage:            submissions ~5KB each + verdict → 5GB/day
+Test cases:         GBs total, cached on judge nodes
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Client (web)
+  │
+  ▼
+┌────────────┐
+│API Gateway │
+└─────┬──────┘
+      │
+   ┌──┼─────────────┬─────────────┐
+   ▼  ▼             ▼             ▼
+┌────┐┌──────────┐┌──────────┐┌──────────┐
+│Prob││Submission││Leaderbrd ││Contest   │
+│ Svc││  API     ││ Service  ││ Service  │
+└─┬──┘└────┬─────┘└────┬─────┘└────┬─────┘
+  │        │            │            │
+  │        ▼            │            │
+  │   ┌─────────┐       │            │
+  │   │ Kafka   │       │            │
+  │   │ (queue) │       │            │
+  │   └────┬────┘       │            │
+  │        │            │            │
+  │        ▼            │            │
+  │   ┌──────────────┐  │            │
+  │   │ Judge Workers│  │            │
+  │   │ (sandboxed)  │  │            │
+  │   └────┬─────────┘  │            │
+  │        │            │            │
+  ▼        ▼            ▼            ▼
+┌────────┐ ┌──────────┐ ┌──────┐ ┌────────┐
+│Postgres│ │Cassandra │ │Redis │ │Postgres│
+│(probs) │ │(submiss.)│ │(brd) │ │(cont.) │
+└────────┘ └──────────┘ └──────┘ └────────┘
+\`\`\`
+
+## Detailed Component Design
+
+### Judging Pipeline (the core)
+
+1. User submits code → Submission API
+2. Submission stored with status="QUEUED"
+3. Published to Kafka: \`judge_queue\` topic
+4. Judge Worker pulls task:
+   a. Spin up sandbox (Docker container with no network, restricted syscalls)
+   b. Compile code (record CE if fails)
+   c. For each test case: run with input, compare output
+   d. Enforce time limit (per-test) and memory limit (cgroups)
+   e. Aggregate verdict
+5. Update submission status; notify user via WebSocket
+
+### Sandboxing — security is paramount
+**Threat model**: malicious user submits code attempting to:
+- Read other users' data on host
+- Crash the judge
+- Network exfiltration
+- Cryptomining
+- Fork bomb / consume all resources
+
+**Defenses (defense in depth)**:
+- **Docker / nsjail / firejail**: process isolation, namespace separation
+- **No network**: \`--network=none\`
+- **Read-only FS** except a small /tmp scratch (limited size)
+- **seccomp filters**: whitelist only safe syscalls (no \`ptrace\`, \`mount\`, \`reboot\`)
+- **cgroups**: hard CPU and memory limits; OOM-killed if exceeded
+- **ulimit**: max processes, max file size
+- **Stricter for high-risk languages**: C/C++ run with even tighter sandbox
+- **Ephemeral hosts**: judge VMs reset after each task or batch
+
+Many judges use **isolate** (IOI sandbox) or custom thin wrappers around Linux primitives.
+
+### Verdicts
+- **AC** (Accepted): output matches expected, within limits
+- **WA** (Wrong Answer): output mismatch
+- **TLE** (Time Limit Exceeded): exceeded time per test
+- **MLE** (Memory Limit Exceeded)
+- **RE** (Runtime Error): segfault, divide by zero, etc.
+- **CE** (Compile Error)
+
+For partial-credit problems: aggregate per-test scores.
+
+### Test Case Storage
+- Hidden test cases stored encrypted in S3
+- Judge worker downloads and caches locally per problem
+- Decryption key fetched per-task
+- Strict access logging — leaked test cases ruin a problem forever
+
+### Determinism
+- Same code on same input must always produce same verdict
+- Pin Linux kernel + libc versions
+- Disable CPU frequency scaling (use performance governor)
+- Run tests in order; sum CPU time precisely with \`getrusage\`
+- Use process-level CPU limit, not wall-clock (accounts for system load)
+
+### Leaderboard (during contest)
+- Each AC submission updates user's score in Redis sorted set
+- \`ZINCRBY contest:{id}:scores user_id +score\`
+- Live leaderboard query: \`ZREVRANGE contest:{id}:scores 0 100\`
+- Tie-breaker by submission time (earlier wins)
+- Frozen leaderboard last hour (don't show changes; reveals at end)
+
+## Database Schema
+\`\`\`
+problems (Postgres)
+  problem_id, title, statement (markdown), difficulty,
+  time_limit_ms, memory_limit_mb, tags[]
+
+test_cases (S3 + DB metadata)
+  problem_id, test_id, input_hash, output_hash, weight
+
+submissions (Cassandra, partition: user_id, cluster: created_at DESC)
+  submission_id, user_id, problem_id, language, code,
+  verdict, time_used, memory_used, created_at, contest_id?
+
+contests
+  contest_id, title, start_at, end_at, problem_ids[]
+
+contest_scores (Redis sorted set + Postgres for persistence)
+\`\`\`
+
+## Scaling Strategy
+- **Judge worker pool**: auto-scale on Kafka backlog. Scale up before contest start.
+- **Multiple judge tiers**: fast queue (during-contest priority), normal queue
+- **Test case cache** on judge nodes; LRU evict
+- **Sharded submissions DB** by user_id
+- **Stateless API tier**
+
+## Trade-offs & Bottlenecks
+- **Sandbox security vs performance**: more layers = slower. Tune carefully.
+- **Test case secrecy vs caching**: caching helps perf but increases leak risk. Encrypt at rest; access-log every read.
+- **Contest fairness**: latency from submit to verdict matters. Surge capacity is critical.
+- **Bottleneck**: judge throughput during contests. 1000/sec for major contests. Pre-scale.
+- **Languages with high startup cost** (Java, JVM warm-up): use process pools or AOT compilation to reduce overhead.
+
+## Follow-up Questions
+1. **How to prevent test case leaks?** Encrypt; access via short-lived signed URLs; log all access; rotate test cases between contests.
+2. **What about interactive problems?** Judge spawns checker process that talks to user code via stdin/stdout. Both processes sandboxed.
+3. **How do plagiarism detection tools work?** Tokenize code; compute structural hashes (AST-based); MOSS algorithm finds similar fragments. Run post-contest.
+4. **Special judge (custom checker)?** For problems with multiple correct outputs (e.g., "any valid path"), a custom checker compares user output to expected, both as input. Same sandbox.
+5. **What about distributed compute / parallel programming problems?** Multi-process sandbox with controlled cores; measure aggregate CPU.
+6. **Why not run judge in the user's browser (Pyodide etc.)?** Trust issue — can't trust the verdict. Used for "playground" but not official judging.
+7. **How to handle a popular problem getting a million submissions?** Cache test inputs/outputs locally on judges; horizontal scale workers; sharded leaderboard updates.`,
+
+  'Design Airbnb': `## Functional Requirements
+- Hosts list properties with photos, descriptions, calendar
+- Guests search by location, dates, guests, filters
+- Booking with date-range availability check
+- Messaging between host and guest
+- Reviews (after stay)
+- Payments with delayed payout to host
+- Wish lists, host profiles
+
+## Non-Functional Requirements
+- **Scale**: 150M+ users, 7M+ listings, 1M+ bookings/day
+- **Consistency**: STRONG on bookings (no double-booking same dates)
+- **Latency**: search < 500ms; booking < 2s
+- **Trust**: critical — strangers staying in strangers' homes (verification, ratings, insurance)
+- **Multi-currency, multi-language, multi-region**
+
+## Differences From Hotel Booking
+- Each listing is unique (1 unit), not a pool of identical rooms
+- Host approval flow (instant book vs request to book)
+- Long-tail inventory: 7M individual properties vs hotel rooms
+- Host messaging/coordination vital
+- Pricing per night with seasonal/weekend variations
+- Cleaning fees, security deposits, service fees
+
+## High-Level Architecture
+\`\`\`
+Guest / Host App
+       │
+       ▼
+┌──────────────────┐
+│  API Gateway     │
+└────┬─────┬───┬───┴──────────┐
+     │     │    │              │
+     ▼     ▼    ▼              ▼
+┌──────┐┌─────┐┌────────┐┌─────────┐
+│Listng││Srch ││Booking ││Messaging│
+│ Svc  ││ Svc ││ Service││ Service │
+└──┬───┘└─┬───┘└───┬────┘└────┬────┘
+   │      │        │           │
+   ▼      ▼        ▼           ▼
+┌──────┐┌──────┐┌────────┐┌────────┐
+│Postgres│Elasticsearch│Postgres│Cassandra│
+│listings││+geo/avail   ││books   ││messages│
+└──────┘└──────────────┘└────────┘└────────┘
+\`\`\`
+
+## Database Schema
+\`\`\`
+listings (Postgres)
+  listing_id, host_id, title, description, location, photos[],
+  amenities[], property_type, max_guests, base_price, 
+  cleaning_fee, status, instant_book_enabled
+
+availability (per listing per date)
+  listing_id, date, status (available | booked | blocked),
+  price_today  -- can override base price
+  PRIMARY KEY (listing_id, date)
+
+bookings
+  booking_id, guest_id, listing_id, check_in, check_out,
+  guest_count, total_paid, status, created_at, payment_id
+
+reviews
+  review_id, booking_id, reviewer_id, target_id, target_type (host|guest),
+  rating, text, created_at
+
+messages (Cassandra, partition: thread_id)
+  thread_id, message_id, sender_id, recipient_id, body, sent_at
+
+users
+  user_id, name, email, profile, verifications (gov_id, phone, email)
+\`\`\`
+
+## Search & Availability — The Hard Part
+
+For Airbnb, search must include date availability — a listing is only relevant if all requested nights are free.
+
+**Naive**: filter listings by location, then for each check availability — too slow at scale.
+
+**Better: index availability into Elasticsearch**
+- Each listing has \`available_dates\` field (compact representation, e.g., bitmap or list)
+- Query combines geo + filters + "available_dates includes all of [check-in..check-out]"
+- ES supports complex queries efficiently
+
+**Even better: pre-aggregated daily availability indexes**
+- Per date, separate index of available listings
+- Query: intersect indexes for all dates in range
+- Use bloom filters for fast "definitely not available" rejection
+
+## Detailed Component Design
+
+### Booking Flow with Strong Consistency
+\`\`\`sql
+BEGIN;
+SELECT date, status FROM availability
+  WHERE listing_id=? AND date BETWEEN ? AND ?
+  FOR UPDATE;
+-- ensure all rows = 'available'
+UPDATE availability SET status='booked'
+  WHERE listing_id=? AND date BETWEEN ? AND ?;
+INSERT INTO bookings (...) VALUES (...);
+COMMIT;
+\`\`\`
+Row-level locks prevent overlap. Throughput sufficient because most bookings target different listings.
+
+### Instant Book vs Request to Book
+- **Instant Book**: guest books immediately; payment authorized; host notified
+- **Request**: guest submits request; host has 24h to accept/decline; payment captured on accept
+
+### Pricing
+- Base price per night × number of nights
+- Seasonal/weekend multipliers (host-configurable or Smart Pricing ML)
+- Cleaning fee (one-time)
+- Service fee (Airbnb's cut)
+- Taxes vary by jurisdiction
+- Smart Pricing ML: suggests prices to host based on local demand
+
+### Payment & Payout (delayed)
+- Guest pays at booking → held by Airbnb (escrow)
+- 24h after check-in: payout to host (minus host service fee)
+- If issue (cancellation, damage claim): refund to guest, dispute resolution
+- Compliance: tax withholding per country
+
+### Messaging
+- WebSocket for real-time chat (or long-poll fallback)
+- Pre-booking inquiry vs post-booking communication
+- Auto-translation feature (language detection + machine translation)
+- Moderation (anti-fraud — block sharing of off-platform contact info)
+
+### Host Calendar
+- Hosts can mark dates as blocked (unavailable)
+- iCal sync with external calendars (Google, hotel PMS)
+- Bulk operations: "block all weekends"
+
+### Reviews — Trust Mechanism
+- Both sides write blind: reviews hidden until both submitted (or 14 days pass)
+- Prevents retaliation (host won't write bad review fearing guest's response)
+- Cannot review without completed stay
+- Public reviews build trust; private feedback to platform
+
+## Scaling Strategy
+- **Read-heavy**: cache listings, photos (CDN), search results
+- **Search ES cluster** sharded by region
+- **Booking DB sharded by listing_id**: locks isolated per listing
+- **Photos**: thousands per listing × millions of listings → S3 + CDN, multi-region
+- **Async pipelines**: post-booking notifications, payouts, indexing
+
+## Trade-offs & Bottlenecks
+- **Trust at scale**: review/verification system is core. Fraudulent listings, fake reviews, scams must be caught.
+- **Inventory diversity**: every listing unique → search ranking complex. ML scoring critical.
+- **Pricing complexity**: dynamic pricing, taxes, fees, currency. Lots of edge cases.
+- **Bottleneck**: photo storage and CDN bandwidth. Aggressive image variants.
+- **Edge case**: host cancels last-minute (relocation, double-listed). Penalties; Airbnb covers gap with comparable property.
+
+## Follow-up Questions
+1. **How does Airbnb prevent fraud (fake listings)?** Verification (gov ID, phone, email); host history; ML on listing patterns; community flagging.
+2. **Smart Pricing how does it work?** ML model trained on similar listings, local events, demand signals. Suggests prices to maximize host revenue.
+3. **Wishlists / Saves at scale?** Per-user list of listing IDs. Cassandra (partition: user_id). Pre-computed availability for shown listings.
+4. **What about Airbnb Plus / Luxe?** Curated tiers with verified standards. Separate inventory pool; manual review.
+5. **Cross-border bookings (currency, tax)?** Charge in guest's currency; pay host in their currency; FX hedging. Tax withholding per local rules.
+6. **Search ranking?** Personalized: past stays, click-through, conversion likelihood. Ranking model = ML on engagement features.
+7. **What if a host cancels close to check-in?** Penalty to host (rating impact, payout deduction); relocation grant to guest; Airbnb finds comparable listing.`,
+
+  'Design Payment System': `## Functional Requirements
+- Process payments: card, bank transfer, wallet
+- Authorize → Capture two-phase model
+- Refunds, chargebacks
+- Idempotency: retry safe (no double-charge)
+- Multi-currency, FX
+- Subscription billing (recurring)
+- Compliance: PCI DSS, fraud detection
+- Webhooks to merchants on events
+
+## Non-Functional Requirements
+- **Scale**: 1B transactions/day globally (Stripe-scale: 200B+ annually)
+- **Consistency**: STRONG — money cannot be lost or duplicated
+- **Latency**: < 500ms for authorization
+- **Availability**: 99.99%+ — outages are catastrophic and visible
+- **Auditability**: every cent traceable; immutable event log
+- **Security**: PCI DSS Level 1; encryption everywhere
+
+## Capacity Estimation
+\`\`\`
+Transactions/day:    1B   →  ~12K/sec average, ~50K peak (Black Friday)
+Storage:             ~1KB/transaction × retention (years for compliance)
+~10s of TB/year, retained 7+ years for audit
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Merchant
+   │
+   │  HTTPS + idempotency key
+   ▼
+┌──────────────────────┐
+│   Public API         │
+│   (PCI scope)        │
+└──────────┬───────────┘
+           │
+           ▼
+   ┌──────────────┐
+   │ Idempotency  │ ← Redis cache of completed requests
+   │ Layer        │
+   └──────┬───────┘
+          │
+          ▼
+   ┌──────────────┐
+   │ Risk / Fraud │ ← ML scoring
+   │ Service      │
+   └──────┬───────┘
+          │
+          ▼
+   ┌──────────────┐
+   │ Payment Core │ → Card networks (Visa/MC) / banks
+   │ (auth/capture)│
+   └──────┬───────┘
+          │
+          ▼
+   ┌──────────────────────────┐
+   │ Ledger (immutable)        │
+   │ - debits and credits      │
+   │ - source of truth         │
+   └──────┬───────────────────┘
+          │
+          ▼
+   ┌──────────────┐
+   │ Webhook      │ → notify merchant of events
+   │ Service      │
+   └──────────────┘
+\`\`\`
+
+## Detailed Component Design
+
+### Idempotency — Critical
+Network failures cause clients to retry. Without idempotency, retries = duplicate charges.
+
+**Mechanism**:
+- Every request includes \`Idempotency-Key\` header (UUID per logical operation)
+- Server checks cache: has this key been processed?
+  - **Yes**: return cached response
+  - **No**: process; cache result
+- TTL ~24h
+- Unique constraint on (merchant_id, idempotency_key) in Postgres for durability
+
+### Two-Phase Payment Model
+1. **Authorize**: card network reserves funds (no money moved yet). Returns auth_id.
+2. **Capture**: actually transfers money. Can be partial. Must be done within ~7 days of auth (network rules).
+
+This separation enables: holds (e.g., hotel pre-auth), shipping-on-fulfillment (Amazon model), reversals.
+
+### Ledger — Immutable Source of Truth
+Built on **double-entry bookkeeping**:
+- Every transaction = two entries (debit + credit) with equal amounts
+- Always balances (sum of debits = sum of credits)
+- Append-only — never updated
+
+\`\`\`
+Charge $10 to customer A:
+  Debit:  customer_A    -$10
+  Credit: merchant_A    +$10
+
+Refund $10:
+  Debit:  merchant_A    -$10  (reversal)
+  Credit: customer_A    +$10
+\`\`\`
+
+Account balances are derived: \`SELECT SUM(amount) WHERE account_id=A\`. Pre-aggregate snapshots for performance.
+
+### Card Network Integration
+- Calls to Visa/MC/Amex via secure connections (acquirer banks)
+- Each network has its own protocol (ISO 8583 traditionally, REST APIs increasingly)
+- Idempotency on our side — but network calls themselves are not always idempotent. Track auth/capture IDs carefully.
+- Fallback acquirers for redundancy: if primary down, route to secondary
+
+### Fraud Detection
+- Per-transaction scoring (sub-100ms): velocity, geo, device fingerprint, amount, merchant category
+- ML models trained on historical fraud labels
+- Decisions: APPROVE / DECLINE / REVIEW (sent to manual queue)
+- 3D Secure (3DS) authentication for high-risk: redirects to issuer for OTP/biometric
+
+### Webhooks to Merchants
+- On state changes: \`payment.succeeded\`, \`refund.created\`, \`dispute.created\`
+- Delivered via HTTPS POST to merchant-registered URL
+- Retry on failure with exponential backoff (5 min, 15 min, 1h, 6h, 24h)
+- Signed with HMAC for authenticity
+- Merchant must be idempotent (we may deliver same event twice)
+
+### Subscription Billing
+- Cron-like scheduler runs each minute
+- Picks subscriptions with \`next_billing_date <= now\`
+- Creates a charge (auto-retries on transient failure)
+- On final failure: send dunning emails, eventually cancel
+
+## Database Schema
+\`\`\`
+payments (Postgres, sharded by merchant_id)
+  payment_id, merchant_id, amount, currency, status (pending|authorized|captured|failed),
+  idempotency_key, customer_id, created_at, captured_at,
+  metadata JSONB
+
+ledger_entries (append-only; double-entry)
+  entry_id, payment_id, account_id, amount (signed), currency, posted_at
+
+accounts
+  account_id, type (customer | merchant | platform), currency, balance_snapshot
+
+refunds
+  refund_id, payment_id, amount, status, reason, created_at
+
+disputes (chargebacks)
+  dispute_id, payment_id, status, evidence_files[], deadline
+
+webhook_events
+  event_id, payment_id, type, payload, created_at
+
+webhook_deliveries
+  delivery_id, event_id, url, attempt, response_code, attempted_at
+\`\`\`
+
+## Scaling Strategy
+- **Sharded by merchant_id**: most queries scoped to one merchant
+- **Multi-region active-passive**: primary region writes; replicate ledger to others; failover < 1 min
+- **Read replicas**: balance lookups, history queries
+- **Webhook delivery**: horizontally scaled; per-merchant retry queues
+- **Ledger snapshots**: pre-aggregate balances every minute for fast lookups
+
+## Trade-offs & Bottlenecks
+- **Strong consistency required everywhere** — Postgres or Spanner, not eventual
+- **Network dependency**: card networks down = we're down. Multi-acquirer routing essential.
+- **Compliance overhead**: PCI scope expensive; isolate card data to a small subset of services. Use tokenization to keep most services out of scope.
+- **Bottleneck**: card network throughput. Pre-arrange capacity for Black Friday. Queue with backoff if hit limits.
+- **Reconciliation**: at end-of-day, every transaction must match: our ledger, acquirer reports, bank statements. Discrepancies investigated manually.
+
+## Follow-up Questions
+1. **What is PCI DSS and how does it affect design?** Card data has strict handling rules. Isolate to a "PCI-scope" zone with tighter auditing. Use tokenization (replace card with token) outside this zone.
+2. **How do you handle a partial refund?** Multiple refunds against one payment, summing to ≤ original. Each is a separate ledger entry pair.
+3. **Chargeback flow?** Customer disputes via bank → bank pulls funds back. We notify merchant; merchant can submit evidence; arbitrator decides. Fees apply.
+4. **Multi-currency conversion?** Charge in customer currency; settle to merchant in their currency. FX rate locked at capture; small spread = our revenue.
+5. **What if our database is down during a charge?** Queue requests; return 503; client retries (with same idempotency key). Better to fail than risk inconsistency.
+6. **How does Stripe's "atomic transfers" work (Connect)?** Multi-account ledger entries in one transaction: customer pays, platform gets fee, merchant gets the rest. Postgres transactions ensure all-or-nothing.
+7. **Recurring billing failure handling?** Smart retries (Stripe's "Dunning"): retry on different days, switch to backup card, send email reminders. Eventually cancel subscription.`,
+
+  'Design Recommendation': `## Functional Requirements
+- Suggest items (products, videos, songs) personalized to a user
+- Updated regularly with fresh content
+- Multiple contexts: home page, "more like this", emails
+- A/B testable
+- Cold-start handling (new users, new items)
+- Diversity and serendipity (avoid filter bubbles)
+
+## Non-Functional Requirements
+- **Scale**: 100M+ users, 10M+ items, billions of interactions
+- **Latency**: < 100ms to serve recommendations at request time
+- **Freshness**: incorporate recent user actions within minutes
+- **Quality**: measurable via A/B tests (CTR, watch time, conversion)
+- **Privacy**: respect user data preferences
+
+## Capacity Estimation
+\`\`\`
+Recs requests:    100M users × 30/day = 3B/day → 35K/sec, 100K peak
+Item catalog:     10M items × ~1KB embeddings = 10GB
+User vectors:     100M × ~1KB = 100GB
+Interactions log: 10B events/day
+\`\`\`
+
+## Two-Stage Architecture (industry standard)
+
+\`\`\`
+              User context
+                  │
+                  ▼
+          ┌──────────────┐
+          │ STAGE 1:      │
+          │ Candidate     │  10M items → 500-1000 candidates
+          │ Generation    │  (fast, recall-focused)
+          └──────┬────────┘
+                 │
+                 ▼
+          ┌──────────────┐
+          │ STAGE 2:      │
+          │ Ranking       │  rank by predicted engagement
+          │ (heavy ML)    │
+          └──────┬────────┘
+                 │
+                 ▼
+          ┌──────────────┐
+          │ Re-ranking    │  diversity, freshness, business rules
+          │ Filters       │
+          └──────┬────────┘
+                 │
+                 ▼
+          Top-N served to user
+\`\`\`
+
+## Stage 1: Candidate Generation
+**Goal**: from 10M items, narrow to 500-1000 candidates fast.
+
+Multiple sources combined:
+- **Collaborative filtering**: "users like you also liked" — matrix factorization or embeddings
+- **Content-based**: "items similar to what you watched" — content embedding nearest-neighbors
+- **Trending / popular**: top items globally or in your demographic
+- **User history**: items you viewed but didn't complete; reminders
+- **Editorial**: hand-curated for marketing
+- **Item-item**: if you watched X, candidates are videos co-watched with X
+
+Embedding-based approach:
+- User vector (learned) + item vectors (learned)
+- ANN (Approximate Nearest Neighbor) lookup: e.g., FAISS, ScaNN
+- Sub-10ms for top-1000 across 10M items
+
+## Stage 2: Ranking
+**Goal**: re-score 500-1000 candidates with heavier model for accuracy.
+
+**Inputs to ranker**:
+- User features: demographics, history, current session, time of day, device
+- Item features: category, popularity, freshness, creator, embeddings
+- Interaction features: cross of user × item (e.g., have they watched this creator before)
+- Context: home page vs search vs email
+
+**Model architectures**:
+- Logistic regression (simple, interpretable, fast)
+- Gradient boosted trees (XGBoost) — strong baseline
+- Deep learning (DLRM, Wide & Deep, transformers) — best performance, more compute
+
+**Output**: probability of action (click, watch, purchase). Rank by expected value.
+
+## Stage 3: Re-ranking & Business Logic
+- **Diversity**: penalize too-similar items in top results
+- **Recency**: boost newer content
+- **Cold-start**: blend in trending items for new users
+- **Business rules**: promote sponsored content, hide blacklisted, respect user filters
+- **Exploration vs exploitation**: ε-greedy or Thompson sampling — sometimes show non-top items to learn user preferences
+
+## Detailed Component Design
+
+### Online Serving
+\`\`\`
+Request → 
+  Fetch user context (Redis: history, embeddings) →
+  Generate candidates (multiple sources in parallel) →
+  Rank with model (TF Serving / Triton, batched) →
+  Re-rank with rules →
+  Log impressions for next training cycle →
+  Return ordered list
+\`\`\`
+
+### Offline Training Pipeline
+- Daily batch job: read interaction logs (Spark)
+- Generate features (train/eval splits)
+- Train model (TF / PyTorch on GPUs)
+- Evaluate vs baseline (offline metrics: NDCG, Recall@K)
+- A/B test in production before full rollout
+- Model registry; version every model
+
+### Real-Time Features
+- Last 10 actions: streamed via Kafka → Redis (per user)
+- Trending items: Flink job over click stream → updated every minute
+- Inference uses both batch features (yesterday's data) and streamed features (last 5 min)
+
+## Architecture Diagram
+\`\`\`
+Logs (Kafka) ──► Stream Processor ──► Online Feature Store (Redis)
+                                                │
+Logs ──► Spark batch ──► Offline Features ──┐   │
+                                              │   │
+                                              ▼   ▼
+                                         ┌────────────┐
+                                         │  Training  │ ──► Model Registry
+                                         └────────────┘
+                                                          │
+                                                          ▼
+                                                    ┌──────────┐
+                                              ◄─────│ Serving  │◄── Request
+                                                    │ (TF      │
+                                                    │  Serving)│
+                                                    └──────────┘
+\`\`\`
+
+## Scaling Strategy
+- **Candidate gen by ANN**: sub-10ms even at 10M items via FAISS/ScaNN
+- **Model serving**: GPU-batched inference; ~100 candidates per batch; sub-50ms
+- **Cache user embedding** for the session — recompute only on significant action
+- **Multi-stage allows scaling**: stage 1 cheap (recall), stage 2 expensive (precision); fewer items per stage forward
+- **Personalized cache**: cache top-100 recs per user for 5 min; refresh on important actions
+
+## Trade-offs & Bottlenecks
+- **Online latency vs model complexity**: bigger model = better recs but slower. Distill to smaller model for serving.
+- **Freshness vs cost**: recompute candidates every request? Or cache for 5 min? Tune per surface.
+- **Filter bubbles**: optimizing engagement reinforces narrow content. Counter with diversity term, exploration.
+- **Cold start**: new users get trending; new items boosted to gather signals.
+- **Bottleneck**: feature store throughput; GPU inference cost. Optimize features, batch inference.
+
+## Follow-up Questions
+1. **How to evaluate offline?** Hold out last day of data; predict; metrics: NDCG@K, Recall@K, AUC. But online A/B is the only true measure.
+2. **Why two stages?** One stage with full model on 10M items = too slow. Two stages: cheap recall, then precise rank.
+3. **What about explainability?** "Recommended because you watched X" — track which candidate source produced the item; simple explanation. Hard for deep models.
+4. **Negative feedback signal?** "Not interested" button; reduce score for that creator/category. Important — without it, models get stuck.
+5. **Adversarial / spam recommendations?** Items gaming engagement (clickbait); detect via post-click signals (bounce rate, watch completion). Demote in ranker.
+6. **Privacy concerns?** Differential privacy in training; user controls; GDPR compliance (right to forget); on-device inference for sensitive cases.
+7. **Multi-armed bandits vs deep learning?** Bandits faster to adapt with little data; DL better with abundant data. Often combined: bandits for exploration, DL for ranking.`,
+
+  'Design Slack': `## Functional Requirements
+- Workspaces with channels (public, private, DMs)
+- Real-time messaging with threads
+- File sharing
+- Search
+- Notifications (push, email)
+- Integrations (bots, webhooks, third-party apps)
+- Voice/video calls (basic)
+- Presence (online/away)
+
+## Non-Functional Requirements
+- **Scale**: 20M DAU, 12M+ workspaces, 100M+ messages/day
+- **Latency**: < 200ms message delivery within workspace
+- **Availability**: 99.99% — core to many companies' workflows
+- **Persistence**: messages retained per workspace policy (forever for paid)
+- **Search**: enterprise-grade across years of content
+
+## Capacity Estimation
+\`\`\`
+Messages/day:    100M  →  ~1200/sec, peaks ~5K/sec
+Storage:         ~1KB/message + media → ~150 GB text/day, several TB with files
+Connections:     20M concurrent WebSocket at peak (workdays)
+Search index:    100s of TB
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Client (web/desktop/mobile)
+   │
+   │ persistent WebSocket
+   ▼
+┌──────────────────┐
+│  Edge Server     │  (holds WebSockets per user)
+│  - WSS terminate  │
+│  - presence       │
+└────────┬─────────┘
+         │
+   ┌─────┼─────────┬──────────┬──────────┐
+   ▼     ▼         ▼          ▼           ▼
+┌──────┐┌──────┐┌──────────┐┌─────────┐┌──────────┐
+│Msg   ││Chan  ││ Search   ││ Files   ││ Webhooks │
+│ Svc  ││ Svc  ││ Service  ││ Service ││ /Bots    │
+└──┬───┘└──┬───┘└────┬─────┘└────┬────┘└────┬─────┘
+   │       │           │           │           │
+   ▼       ▼           ▼           ▼           ▼
+┌──────┐┌────────┐┌──────────┐┌────────┐┌──────────┐
+│Cass.││Postgres││Elastic   ││ S3 +   ││Webhook   │
+│msgs  ││ chans  ││ search   ││ CDN    ││ delivery │
+└──────┘└────────┘└──────────┘└────────┘└──────────┘
+\`\`\`
+
+## Database Schema
+\`\`\`
+workspaces (Postgres)
+  workspace_id, name, plan_type, created_at
+
+channels
+  channel_id, workspace_id, name, type (public|private|dm), members[]
+
+messages (Cassandra, partition: channel_id, cluster: ts DESC)
+  channel_id, message_id (snowflake), user_id, text, ts,
+  thread_ts? (parent message), edited?, files[], reactions[]
+
+users
+  user_id, workspace_id, name, email, role, status, last_seen
+
+channel_members (Cassandra, partition: channel_id)
+  channel_id, user_id, joined_at, last_read_ts
+
+read_state (per user per channel)
+  user_id, channel_id, last_read_ts, mention_count
+\`\`\`
+
+## Detailed Component Design
+
+### Real-time Connection (WebSocket)
+- Each client opens WebSocket to nearest edge server
+- Edge server registers user_id → server_id in a Redis map
+- Client subscribes to channels (joins their pub-sub topics)
+
+### Message Send Flow
+1. Client → WebSocket → Edge Server
+2. Edge Server validates auth, channel membership
+3. Persists message to Cassandra (channel_id partition)
+4. Publishes to internal pub-sub for channel
+5. Other edge servers holding members of this channel receive event
+6. Push to all open WebSockets for those members
+7. For offline members: enqueue notification (push/email)
+8. Update last_message_ts on channel; update unread counter
+
+### Threads
+- Each thread has a parent message and \`thread_ts\` linking replies
+- Replies stored as messages with \`thread_ts = parent.ts\`
+- Display: reply count on parent; click to expand thread
+
+### Channels & Membership
+- Public channel: workspace-wide read access
+- Private channel: explicit member list
+- DM: 1-to-1 special channel; group DM up to N members
+- Member list in Cassandra; cached in Redis for fast checks
+
+### Read State / Unread Counters
+- Per (user, channel): \`last_read_ts\`, \`mention_count\`
+- Update when client opens channel or scrolls to bottom
+- Unread count = messages with ts > last_read_ts (queried as needed; not stored)
+
+### Search
+- Elasticsearch indexes message text + metadata (workspace, channel, user, time)
+- Permissions enforced at search time: workspace_id filter + channel access check
+- Full-text + facets (by user, by channel, by time)
+- Special: search a thread, search files, search mentions of self
+
+### File Uploads
+- Pre-signed S3 upload URL → client uploads directly
+- File metadata stored; preview generated async (PDF, images)
+- Permissions inherit from channel
+- Search indexes extracted text from PDFs/Docs
+
+### Presence
+- "Online" if active WebSocket; "Away" after 10 min idle; "Offline" if no connection
+- Stored in Redis with TTL
+- Broadcasts changes to channel-mates only when in active conversation (privacy + perf)
+
+### Notifications
+- For DM, mention, or keyword match: push notification + email digest
+- Per-user prefs: schedule (quiet hours), channels muted, etc.
+- Goes through Notification Service (separate) → APNS/FCM/SMTP
+
+### Integrations & Bots
+- Incoming webhook: external service POSTs JSON → injected as bot message
+- Outgoing webhook: events fire → POSTs to external URL
+- Slash commands: /command triggers external endpoint; reply posted to channel
+- App marketplace: OAuth flow; permissions per scope (read messages, post, etc.)
+
+## Scaling Strategy
+- **Connection servers per region**: 50K WebSockets each → many servers
+- **Workspace-level isolation**: most traffic stays within a workspace; partition data by workspace_id
+- **Cassandra for messages**: partition by channel_id; perfect for time-ordered append + read recent
+- **Cache active channels** (Redis): channel metadata, recent messages, members
+- **Edge → core via internal pub-sub** (Redis pub-sub or Kafka): fan-out within workspace
+
+## Trade-offs & Bottlenecks
+- **Stateful WebSockets**: complicate deploys (drain connections gracefully) and load balancing
+- **Search index scale**: per-workspace indexes; older data tiered to cheaper storage
+- **Notifications cost**: many users in many channels = huge fanout. Trim aggressively (mute, do-not-disturb).
+- **Bottleneck**: large workspaces with active general channels (e.g., 10K users, 100s msgs/min). One channel = one Cassandra partition = single shard. Solve by sharding very-active channels manually.
+- **Compliance**: enterprise customers need eDiscovery, retention, DLP. Separate compliance tier.
+
+## Follow-up Questions
+1. **How does Slack handle a workspace with 100K users?** Per-channel scaling; large channels often read-only or limited posters; sub-channelization encouraged.
+2. **What if a popular announcement triggers a notification storm?** Aggregation (one notification per channel per hour during hot threads); per-user rate limit.
+3. **How does Slack do voice/video calls?** WebRTC peer-to-peer or via media server (SFU); signaling over existing WebSocket.
+4. **Real-time typing indicator?** Ephemeral pub-sub event; not persisted; broadcast only to channel members currently viewing.
+5. **How to handle a workspace migrating to a new region?** Replicate data; flip DNS; coordinate (workspace usually quiet for migration window).
+6. **How would you implement "remind me of this message later"?** Scheduled job; stores user_id, message_id, due_at; sends DM at due_at.
+7. **Compliance / eDiscovery search?** Special admin role; reads all messages including DMs (regulated); separate audit log of every access.`,
+
+  'Design Social Network': `## Functional Requirements
+- User profiles with bio, photos
+- Friend / follow relationships (bi-directional or asymmetric)
+- News feed: posts from connections
+- Post content: text, images, videos, links
+- Likes, comments, shares
+- Direct messages
+- Search (people, posts)
+- Groups, events (optional)
+
+## Non-Functional Requirements
+- **Scale**: 1B users, 500M DAU, 1B posts/day across all surfaces
+- **Read-heavy**: feed views ≫ posts (~100:1)
+- **Latency**: feed load < 300ms; post creation < 500ms
+- **Availability**: 99.99%
+- **Eventual consistency** OK for feed; strong for friend lists, payment
+
+## Capacity Estimation
+\`\`\`
+Posts/day:    1B  → ~12K/sec, ~50K peak
+Feed reads:   500M users × 30 loads/day = 15B/day → 175K/sec
+Storage:      ~1KB/post text + media → 1TB/day text + PB/day media
+Friendships:  500B+ edges in social graph
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Client
+   │
+   ▼
+┌───────────────────┐
+│   API Gateway     │
+└────┬─────┬───┬────┴───────────────┐
+     │     │    │                    │
+     ▼     ▼    ▼                    ▼
+┌──────┐┌─────┐┌────────────┐ ┌──────────┐
+│Profile│Post ││ Feed Service│ │ Social   │
+│ Svc  ││ Svc ││  (timeline) │ │ Graph    │
+└──┬───┘└─┬───┘└──────┬──────┘ └────┬─────┘
+   │       │           │              │
+   │       │           ▼              │
+   │       │      ┌─────────┐         │
+   │       │      │  Redis  │  ← timelines
+   │       │      └────┬────┘
+   │       │           │
+   ▼       ▼           ▼              ▼
+┌──────────────────────────┐ ┌──────────┐
+│    Cassandra              │ │TAO-style │
+│   posts, comments, likes  │ │ Graph DB │
+└──────────────────────────┘ └──────────┘
+                                    │
+                                    ▼
+                              ┌──────────┐
+                              │  MySQL   │
+                              │ (sharded)│
+                              └──────────┘
+        ▲
+        │
+   Fanout Service ◄── Kafka ◄── Post events
+\`\`\`
+
+## Key Components
+
+### Social Graph
+This is the heart. Billions of edges; queries like "list my friends," "are A and B friends?", "friends of friends."
+
+**Storage**: TAO (Facebook's graph-on-MySQL system). Sharded MySQL with a graph abstraction layer + aggressive caching.
+
+**Schema**:
+- \`users(id, name, ...)\`
+- \`edges(from_id, to_id, type, created_at)\` where type ∈ {follow, friend, block}
+- Indexed by from_id (forward) and to_id (reverse)
+
+**Caching**: ~99% of edge queries hit cache. Memcached/cachelib in front.
+
+### Feed (the iconic challenge)
+**Hybrid fanout** (same as Twitter/Instagram):
+- **Average users**: fanout-on-write to followers' feeds (Redis sorted sets)
+- **Influencers** (>10K followers): fanout-on-read; their posts merged at read time
+- **Hybrid**: for everyone, the feed is built dynamically from precomputed + celebrity merge
+
+**Ranking**:
+- Pure chronological → boring, low engagement
+- ML-ranked feed: ranks by predicted engagement, boosts close friends, mixes in suggestions
+- Feed re-ranked at read time (cached for 60-90 seconds)
+
+### Posts
+- Writes to Cassandra (partition: user_id, cluster: ts DESC)
+- Media uploaded to S3, served via CDN
+- Comments stored separately (partition: post_id) for fast comment fetch
+
+### Notifications
+- Like/comment/follow event → Kafka → Notification Service
+- Aggregated within window (1 min: "John and 3 others liked your post")
+- Push, email, in-app counter
+
+### Direct Messages
+- Separate from feed/posts subsystem (different access patterns, encryption)
+- Same architecture as WhatsApp / Slack DMs
+
+### Search
+- Two indexes: people (Elasticsearch on user names + bio + interests), posts (full-text on visible posts)
+- Permissions enforced at search: only show posts you can see
+
+## Privacy & Permissions
+- Each post has visibility: public, friends-only, custom list
+- Feed query must filter to visible posts — typically denormalized "audience" set per post
+- Friends-of-friends visibility especially expensive — pre-compute at write time
+
+## Detailed Component Design
+
+### Post Creation Flow
+1. Client uploads media to S3 (pre-signed URL)
+2. POST /api/posts with text + media references
+3. Post Service: writes to Cassandra; emits Kafka event \`post.created\`
+4. Fanout Service consumes:
+   - Resolve audience (friends list, followers, custom)
+   - For each member, push post_id to their Redis feed (capped to 1000)
+5. Feed Service rebuilds ranked feed for active users
+6. Notifications: tagged people get notified
+
+### Feed Read Flow
+1. Client requests \`/api/feed?cursor=...\`
+2. Feed Service: get user's pre-computed feed from Redis
+3. Identify celebrity follows; pull their recent posts (from Cassandra)
+4. Merge by timestamp
+5. ML re-rank
+6. Hydrate post IDs → full posts (batch from cache/Cassandra)
+7. Return top 20
+
+## Scaling Strategy
+- **Sharded everything**: posts by user_id, edges by from_id
+- **Aggressive caching**: ~95% cache hit ratio on graph queries
+- **Multi-DC active-active**: writes go to home DC; replicate; eventual consistency across DCs
+- **CDN for media**: 99% of bandwidth at edge
+- **Per-region serving**: feed served from nearest DC
+
+## Trade-offs & Bottlenecks
+- **Eventual consistency**: a post might appear in feeds at slightly different times. Acceptable.
+- **Hot users (celebrities)**: special-cased for fanout; hot in caches; replicated
+- **Privacy enforcement**: must check on every read; expensive. Mitigation: precompute audience sets at write time.
+- **Storage cost**: dominant. Old data tiered to cold storage; aggressive media compression; lifecycle policies.
+- **Bottleneck**: graph queries for friends-of-friends, recommendations. Offline batch precomputation; serve precomputed.
+
+## Follow-up Questions
+1. **How to recommend friends ("People you may know")?** Mutual friends (graph traversal); shared schools/work; co-occurrence in events. Computed offline daily.
+2. **How to detect bot accounts?** Behavioral signals: posting frequency, engagement asymmetry, network structure. ML models; CAPTCHAs at suspicious actions.
+3. **Content moderation at scale?** Automated (CSAM detection, NSFW classifiers); human review queues; community reports.
+4. **News Feed vs Stories?** Stories ephemeral (24h, Redis TTL); separate ranker prioritizing recency. Same fanout principles.
+5. **How to handle GDPR delete?** Async cascade: posts, comments, likes, friend edges. Tombstones for 30 days; then purge. CDN purge.
+6. **Privacy: who can see my profile?** Stored visibility settings per profile field. Server enforces on every render. Search filters to visible.
+7. **What about the social graph's hairball (everyone connected to everyone)?** Use density-aware sharding; don't replicate all edges everywhere. TAO solves this with origin-DC reads + cross-DC cache invalidation.`,
+
+  'Design Google Maps': `## Functional Requirements
+- Display interactive map (zoom, pan)
+- Search places (POI, addresses)
+- Routing: A → B with time/distance
+- Real-time traffic
+- Turn-by-turn navigation
+- Multi-modal: driving, walking, transit, cycling
+- ETA prediction with current conditions
+- Street View, satellite imagery (optional)
+
+## Non-Functional Requirements
+- **Scale**: 1B+ users, 1B routing requests/day
+- **Latency**: map tile load < 100ms; route < 500ms
+- **Coverage**: global, multiple languages
+- **Freshness**: traffic real-time; map data weeks/months
+- **Availability**: 99.99% — used in critical situations (driving)
+
+## Capacity Estimation
+\`\`\`
+Map tiles:        Earth at zoom 20 → ~10^12 tiles. ~50PB compressed
+Routing requests: 1B/day → ~12K/sec
+Traffic data:     billions of GPS points/day from device telemetry
+POIs / places:    100M+ globally
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Client (mobile / web)
+   │
+   ▼
+┌────────────┐
+│   CDN      │ ← serves map tiles (huge cache hit rate)
+└──────┬─────┘
+       │
+   ┌───┼─────────────┬──────────────┐
+   ▼   ▼             ▼              ▼
+┌──────┐┌──────────┐┌──────────┐┌────────────┐
+│Tile  ││  Search   ││ Routing  ││  Traffic    │
+│ Svc  ││  (places) ││ Service  ││  Service    │
+└──┬───┘└────┬─────┘└────┬─────┘└──────┬─────┘
+   │         │             │            │
+   ▼         ▼             ▼            ▼
+┌──────┐┌──────────┐┌──────────┐┌────────────┐
+│Tile  ││Elastic    │ Road     │GPS data     │
+│Storage│search +    │Graph     │aggregator  │
+│ S3   ││geo index  │(graph DB)│(streaming)  │
+└──────┘└──────────┘└──────────┘└────────────┘
+\`\`\`
+
+## Map Tiles
+- World divided into tiles in a quad-tree (zoom levels 0–22)
+- Each tile is an image (256×256 PNG/WebP) or vector data
+- Pre-rendered server-side from underlying map data
+- Vector tiles allow client-side rendering (smaller, scalable, themable)
+- Massive scale → CDN caches everything; tiles updated infrequently
+
+\`\`\`
+At zoom z, tile x,y coordinates map to lat/lng range.
+Tile = f(z, x, y); URL = https://maps.../tiles/{z}/{x}/{y}.png
+\`\`\`
+
+## Place Search
+- POI database: coordinates, name, category, hours, photos, reviews
+- Elasticsearch indexed: text + geo → \`pizza near me\` does geo + text
+- Autocomplete trie for places (similar to search autocomplete)
+- Personalization: home/work/recent places boosted
+
+## Routing — The Big Algorithm
+
+The road network is a graph:
+- Nodes: intersections
+- Edges: road segments with attributes (length, speed, restrictions)
+- Edge weight = expected travel time (varies with traffic)
+
+**Naive Dijkstra**: works but slow on continent-scale graphs (millions of nodes).
+
+**Real algorithm: Contraction Hierarchies (CH) or Customizable Route Planning (CRP)**:
+- Pre-process road network → multi-level hierarchy where higher levels are "shortcuts"
+- Highways at top, residential at bottom
+- Query: bidirectional search at top of hierarchy → milliseconds for cross-country routes
+- A* with landmark heuristic also fast (ALT algorithm)
+
+**Re-routing with traffic**:
+- Edge weights updated continuously from telemetry
+- Most pre-processed structures must be re-customized periodically
+- Customizable Route Planning (CRP) separates static topology from dynamic weights → fast updates
+
+## Traffic Data Pipeline
+\`\`\`
+Mobile devices send anonymized GPS pings ──► ingestion (Kafka)
+                                                    │
+                                                    ▼
+                                            Stream processor
+                                            (matching to road segments)
+                                                    │
+                                                    ▼
+                                            Per-road-segment speed
+                                            (rolling window)
+                                                    │
+                                                    ▼
+                                            Edge weight DB
+                                                    │
+                                                    ▼
+                                            Routing service
+                                            (refreshes every minute)
+\`\`\`
+
+## ETA Prediction
+- Naive: sum edge times along route
+- Better: ML model with features (traffic, time of day, day of week, weather, historical patterns)
+- Feedback loop: actual travel times update model
+
+## Detailed Component Design
+
+### Search Flow
+1. User types "coffee" with location
+2. Autocomplete suggests places (trie + popularity)
+3. User picks → Search Service queries ES with geo + text
+4. Returns ranked list (distance × rating × open-now × personalization)
+
+### Routing Flow
+1. User requests A → B
+2. Routing Service: A* / CH on pre-processed graph with current traffic weights
+3. Computes 2-3 alternative routes (via avoid-toll, scenic, fastest)
+4. ML ETA per route
+5. Returns polylines + step-by-step instructions
+
+### Turn-by-turn Navigation
+- Client downloads route polyline + instructions
+- Tracks GPS continuously; matches to current road segment
+- Detects deviation → re-route
+- Server occasionally updated for traffic changes; if better route found, prompt
+
+## Scaling Strategy
+- **Tiles on CDN**: 99%+ of map traffic served from edge. Tiles change rarely; cache for days.
+- **Per-region routing graphs**: graph for each continent; cross-continent rare and pre-computed
+- **Read replicas for places**: search load high; reads from replicas
+- **Streaming traffic**: Kafka + Flink processes billions of pings to update edge weights every minute
+- **Vector tiles**: client renders → less server load, more flexible (themes, languages)
+
+## Trade-offs & Bottlenecks
+- **Pre-processing vs freshness**: heavy preprocessing for fast queries; but updating road data requires re-process. Schedule overnight or differential updates.
+- **Map data quality**: ingest from authoritative sources (USGS, OSM, government), satellite imagery analysis, user reports. Disputed boundaries require region-specific maps.
+- **Privacy**: GPS tracking sensitive. Anonymize aggressively; differential privacy on aggregates.
+- **Bottleneck**: routing graph load on memory; multi-region routes require distributed graph or hierarchical search
+- **Multi-modal routing**: combining transit + walking + driving exponentially harder. Domain-specific algorithms.
+
+## Follow-up Questions
+1. **How does Maps know about traffic in real time?** Crowdsourced GPS pings from billions of phones (Google Maps app); commercial sensor data; Waze user reports.
+2. **Why use vector tiles vs raster tiles?** Vector: smaller, scalable, themable, smaller download. Raster: simpler, easier client. Most modern apps use vector.
+3. **How to handle a road closure?** Source feeds (DOT) + crowdsourced reports. Edge weight set to infinity in graph; routing avoids automatically.
+4. **Offline maps?** Client downloads region's tiles + roads + POIs. Routing computed locally with on-device graph (CH precomputed). No real-time traffic.
+5. **How does Apple Maps differ?** Same building blocks. Apple builds own data + buys from TomTom/HERE; Google has more telemetry → better real-time accuracy.
+6. **How does Street View work?** Specialized capture vehicles; ~360 panoramas at intervals along roads; stitched; served as cached tiles per location.
+7. **Multi-modal: combining bus + walk?** Build separate transit graph (schedule-based, not road-based); time-expanded graph (one node per stop per departure). Combine with walking via edges. Heavy precompute.`,
+
+  'Design E-commerce': `## Functional Requirements
+- Browse products with categories, search, filters
+- Product detail pages: photos, descriptions, reviews
+- Cart, wishlist
+- Checkout with shipping & payment
+- Order tracking
+- Inventory across warehouses
+- Reviews and ratings
+- Seller marketplace (multi-vendor optional)
+- Recommendations
+
+## Non-Functional Requirements
+- **Scale**: 200M users, 500M products, 10M orders/day, peak 100K orders/sec on Black Friday
+- **Consistency**: STRONG on inventory, payment; eventual on browsing
+- **Latency**: product page < 300ms; checkout < 2s
+- **Availability**: 99.99% — outages = lost revenue
+- **Multi-region, multi-currency, multi-language**
+
+## Capacity Estimation
+\`\`\`
+Page views:    200M users × 30 pages/day = 6B/day → 70K/sec, 500K Black Friday peak
+Product images: avg 8 per product × 500M = 4B images → multi-PB CDN
+Storage:        product catalog ~5KB × 500M = 2.5TB
+Orders:         10M/day × ~10KB = 100GB/day, retain 7+ years
+\`\`\`
+
+## High-Level Architecture
+\`\`\`
+Client
+  │
+  ▼
+┌────────────┐
+│API Gateway │
+└─────┬──────┘
+      │
+   ┌──┼─────────────┬───────────┬──────────┬─────────────┐
+   ▼  ▼             ▼           ▼          ▼             ▼
+┌────┐┌──────┐┌──────────┐┌──────────┐┌─────────┐┌────────────┐
+│Catlg││Search││ Cart     ││ Order    ││ Payment ││ Inventory  │
+│ Svc ││ Svc  ││ Service  ││ Service  ││ Service ││ Service    │
+└──┬──┘└──┬───┘└────┬─────┘└────┬─────┘└────┬────┘└─────┬──────┘
+   │      │          │           │           │            │
+   ▼      ▼          ▼           ▼           ▼            ▼
+┌─────┐┌─────────┐┌──────┐┌──────────┐┌──────┐┌──────────────┐
+│PG   ││Elastic   ││Redis ││Postgres  ││Stripe││Postgres + Redis│
+│catlg││+ ranker ││(carts)││(orders)  ││(ext) ││(per-warehouse)│
+└─────┘└─────────┘└──────┘└──────────┘└──────┘└──────────────┘
+                                │
+                                ▼
+                         ┌──────────────┐
+                         │  Notification│
+                         │  / Shipping  │
+                         └──────────────┘
+\`\`\`
+
+## Database Schema
+\`\`\`
+products (Postgres + ES index)
+  product_id, title, description, category_id, brand, sku,
+  base_price, attributes (color, size), images[], status
+
+inventory (per product per warehouse)
+  product_id, warehouse_id, quantity_available, quantity_reserved
+  PRIMARY KEY (product_id, warehouse_id)
+
+carts (Redis primary, Postgres backup)
+  cart_id, user_id, items: [{product_id, qty, price_snapshot}],
+  updated_at
+
+orders (Postgres, sharded by user_id)
+  order_id, user_id, items[], status, total, shipping_addr,
+  payment_id, created_at
+
+order_items
+  order_id, product_id, qty, price_at_order, fulfillment_status
+
+reviews (Cassandra, partition: product_id)
+  product_id, user_id, rating, text, created_at, helpful_count
+
+categories (tree)
+  category_id, parent_id, name, slug
+\`\`\`
+
+## Detailed Component Design
+
+### Catalog & Search
+- Catalog Service: CRUD for products
+- Elasticsearch: indexed for search + faceted filters (category, brand, price range, color)
+- Autocomplete trie for query suggestions
+- Re-ranking model: relevance × popularity × conversion likelihood × business priority
+
+### Cart
+- **Redis primary**: ephemeral, fast. Each cart has TTL (e.g., 30 days from last update).
+- Postgres backup for persistence and analytics
+- For logged-out users: cart in browser cookie until login → merged with server cart
+
+### Inventory Management (the hard part)
+**Sources of complexity**:
+- Product available in multiple warehouses
+- Reservation during checkout (don't oversell)
+- Returns to inventory
+- Backorder, presale handling
+
+**Atomic decrement on order**:
+\`\`\`sql
+UPDATE inventory 
+SET quantity_available = quantity_available - 1
+WHERE product_id = ? AND warehouse_id = ? AND quantity_available > 0
+RETURNING quantity_available;
+\`\`\`
+If no row updated → out of stock.
+
+**Reservation pattern** (for high-value carts):
+- On checkout-initiate, reserve inventory for 15 min
+- Convert to sold on payment success; release on timeout/abandon
+
+**Multi-warehouse**: order may span warehouses; pick optimal allocation (closest, lowest shipping, fewest splits).
+
+### Order Lifecycle
+\`\`\`
+Created → Payment_Pending → Paid → Allocated → 
+Picked → Packed → Shipped → Delivered
+                            ↓
+                        Returned → Refunded
+\`\`\`
+Each transition recorded in order_status_history.
+
+### Checkout Saga
+\`\`\`
+1. Reserve inventory          → on fail: out of stock
+2. Charge payment              → on fail: release inventory
+3. Create order record         → on fail: refund + release
+4. Notify warehouse            → on fail: log; manual reconciliation
+5. Send confirmation email     → on fail: log; user can re-fetch
+\`\`\`
+Idempotency at every step.
+
+### Recommendation Engine
+- "Customers who bought X also bought Y"
+- Personalized home page
+- See dedicated Recommendation system design
+
+### Reviews
+- Same model as Yelp; aggregated rating denormalized to products
+
+## Scaling Strategy
+- **Catalog cache**: product details rarely change → CDN cache pages; Redis for hot products (Pareto: 1% of products = 50% of views)
+- **Search at scale**: ES cluster with replicas; cache popular queries
+- **Multi-region active-active**: catalog read from any region; orders pinned to region
+- **Inventory hot-spotting**: popular products under high contention. Pre-allocate to checkout reserves; spread across warehouse rows.
+- **Async pipelines**: order events → fulfillment, notifications, analytics, accounting
+
+## Black Friday / Peak Event Prep
+- 10x normal traffic; pre-scale everything
+- Static catalog pages cached aggressively
+- Inventory hot products: separate Redis cluster
+- Pre-provisioned compute capacity (no autoscaling lag)
+- Game-day chaos testing weeks before
+- Read-only mode flag (worst case: customers can browse but not order — better than total outage)
+
+## Trade-offs & Bottlenecks
+- **Inventory consistency**: row locks limit throughput per product. For very hot products, use Redis-based reservation queue.
+- **Cart vs order separation**: cart is fast (Redis), order is durable (Postgres). Different SLAs.
+- **Multi-currency complexity**: convert at view; lock at checkout; settle in merchant currency.
+- **Bottleneck**: payment processor. Pre-arrange capacity; queue and retry.
+- **Returns / fraud**: 5-30% return rate (apparel highest). Workflow to handle returns is a system in itself.
+
+## Follow-up Questions
+1. **What about flash sales (1-min item launch)?** Same pattern as ticket booking: virtual waiting room, hot Redis allocator, strict idempotency.
+2. **How do you handle multi-vendor (marketplace)?** Each seller has own SKUs and inventory; cart can span sellers; checkout splits to per-seller orders. Payments aggregate.
+3. **Personalization?** ML ranker on home page, recommendations, search results. Shadow CTR as label.
+4. **Abandonded cart recovery?** Email reminder after 1h, 24h. Check-back rate ~10%.
+5. **How to recommend size for clothing?** ML on past purchases + return reasons + brand size charts. "Runs small" warnings.
+6. **Wishlists at scale?** Same as Cassandra carts; no inventory reservation.
+7. **What about counterfeit / illegal items?** Seller verification; ML on listings; takedown system; brand registries (Amazon Brand Registry).`,
+
   }
 };
 

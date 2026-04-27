@@ -51,7 +51,20 @@ app.use('/api/forum', featureCheck('forum'), require('./routes/forum'));
 app.use('/api/study-groups', featureCheck('studyrooms'), require('./routes/studyGroups'));
 app.use('/api/admin-panel', require('./routes/adminPanel'));
 
-
+// ─────────────────────────────────────────────────────────────────────────────
+// TEMPORARY: Seed detailed answers — hit once, then remove this block + redeploy
+// GET https://ai-interviewer-hl6o.onrender.com/run-seed-detailed
+const seedDetailedAnswers = require('./scripts/seed-detailed-answers');
+app.get('/run-seed-detailed', async (req, res) => {
+  try {
+    const result = await seedDetailedAnswers();
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('[SEED ERROR]', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Health check
 app.get('/health', (req, res) => {
